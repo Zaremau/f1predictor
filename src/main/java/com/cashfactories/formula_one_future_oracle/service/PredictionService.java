@@ -53,6 +53,7 @@ public class PredictionService {
                 .anyMatch(n -> n.getRiskKeywords() != null && n.getRiskKeywords().length > 0);
 
 
+
         // --- 3. Практики и Квалификация ---
         double paceScore = 0.0;
         double gridScore = 0.0;
