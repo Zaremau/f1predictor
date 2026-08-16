@@ -7,13 +7,10 @@ import java.util.List;
 
 public interface HistoricalResultRepository extends JpaRepository<HistoricalResult, Long> {
 
-    List<HistoricalResult> findByDriverId(Long driverId);
+    List<HistoricalResult> findByDriver_Id(Long driverId);
 
-    List<HistoricalResult> findByDriverIdAndGpName(Long driverId, String gpName);
+    List<HistoricalResult> findByDriver_IdAndGpName(Long driverId, String gpName);
 
-    // НОВЫЙ МЕТОД: поиск истории по команде
     List<HistoricalResult> findByTeamName(String teamName);
 
-    // Можно усложнить: поиск истории команды на конкретном треке
-    List<HistoricalResult> findByTeamNameAndGpName(String teamName, String gpName);
 }

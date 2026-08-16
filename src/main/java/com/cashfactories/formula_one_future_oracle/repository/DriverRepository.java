@@ -4,4 +4,6 @@ import com.cashfactories.formula_one_future_oracle.model.Driver;
 import org.springframework.data.jpa.repository.JpaRepository;
 
 public interface DriverRepository extends JpaRepository<Driver, Long> {
+
+    Driver findByDriverNumber(Integer driverNumber);
 }

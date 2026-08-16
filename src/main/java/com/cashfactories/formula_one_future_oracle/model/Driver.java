@@ -30,4 +30,7 @@ public class Driver {
 
     @Column(length = 100)
     private String team;
+
+    @Column(name = "driver_number", unique = true)
+    private Integer driverNumber;
 }
