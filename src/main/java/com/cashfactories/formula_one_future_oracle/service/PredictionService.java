@@ -1,19 +1,7 @@
 package com.cashfactories.formula_one_future_oracle.service;
 
-import com.cashfactories.formula_one_future_oracle.model.Driver;
-import com.cashfactories.formula_one_future_oracle.model.GrandPrix;
-import com.cashfactories.formula_one_future_oracle.model.HistoricalResult;
-import com.cashfactories.formula_one_future_oracle.model.News;
-import com.cashfactories.formula_one_future_oracle.model.PracticeResult;
-import com.cashfactories.formula_one_future_oracle.model.Prediction;
-import com.cashfactories.formula_one_future_oracle.model.QualifyingResult;
-import com.cashfactories.formula_one_future_oracle.repository.DriverRepository;
-import com.cashfactories.formula_one_future_oracle.repository.GrandPrixRepository;
-import com.cashfactories.formula_one_future_oracle.repository.HistoricalResultRepository;
-import com.cashfactories.formula_one_future_oracle.repository.NewsRepository;
-import com.cashfactories.formula_one_future_oracle.repository.PracticeRepository;
-import com.cashfactories.formula_one_future_oracle.repository.PredictionRepository;
-import com.cashfactories.formula_one_future_oracle.repository.QualifyingRepository;
+import com.cashfactories.formula_one_future_oracle.model.*;
+import com.cashfactories.formula_one_future_oracle.repository.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -35,7 +23,6 @@ public class PredictionService {
     private final QualifyingRepository qualiRepo;
     private final PredictionRepository predictionRepo;
 
-
     @Transactional
     public List<Prediction> generatePredictions(Long gpId) {
         GrandPrix gp = gpRepo.findById(gpId).orElseThrow();
@@ -44,20 +31,60 @@ public class PredictionService {
 
         // 1. Считаем score для каждого пилота
         for (Driver driver : drivers) {
-            double score = calculateScore(driver, gp);
 
+            // --- РАСЧЕТ МЕТРИК ---
+            double overallHistScore = calculateOverallHistoryScore(driver.getId(), driver.getTeam());
+            double trackHistScore = calculateTrackHistoryScore(driver.getId(), gp.getName());
+
+            // Новости
+            List<News> gpNews = newsRepo.findByGrandPrix_Id(gp.getId());
+            List<News> driverNews = gpNews.stream()
+                    .filter(n -> n.getMentionedDrivers() != null &&
+                            Arrays.asList(n.getMentionedDrivers()).contains(driver.getName()))
+                    .toList();
+
+            double newsScore = 50.0; // Нейтральный базовый уровень
+            if (!driverNews.isEmpty()) {
+                double avgSentiment = driverNews.stream()
+                        .mapToDouble(News::getSentimentScore)
+                        .average().orElse(0.0);
+                newsScore = 50 + (avgSentiment * 50); // Перевод из [-1.0...1.0] в [0...100]
+            }
+            boolean hasPenalty = driverNews.stream()
+                    .anyMatch(n -> n.getRiskKeywords() != null && n.getRiskKeywords().length > 0);
+
+            // Практики и Квалификация
+            double paceScore = 0.0;
+            double gridScore = 0.0;
+            String stage = gp.getStage();
+
+            if ("FP_DONE".equals(stage) || "QUALI_DONE".equals(stage)) {
+                PracticeResult pr = practiceRepo.findTopByGrandPrix_IdAndDriver_IdOrderByLapTimeMsAsc(gp.getId(), driver.getId());
+                if (pr != null) {
+                    paceScore = Math.max(0, 100 - (pr.getGapToP1Ms() / 1000.0) * 10);
+                }
+            }
+
+            if ("QUALI_DONE".equals(stage)) {
+                QualifyingResult qr = qualiRepo.findByGrandPrix_IdAndDriver_Id(gp.getId(), driver.getId());
+                if (qr != null) {
+                    gridScore = Math.max(0, 100 - ((qr.getPosition() - 1) * 5));
+                }
+            }
+
+            // --- ИТОГОВЫЙ СКОР ---
+            double score = calculateScore(stage, overallHistScore, trackHistScore, newsScore, paceScore, gridScore, hasPenalty);
+
+            // --- ФОРМИРОВАНИЕ ПРОГНОЗА ---
             Prediction pred = new Prediction();
             pred.setGrandPrix(gp);
             pred.setDriver(driver);
-            pred.setStage(gp.getStage());
+            pred.setStage(stage);
             pred.setScore(score); // Временно кладем score в @Transient поле
 
-            // Считаем уверенность и риск (методы ниже)
-            pred.setConfidence(calculateConfidence(gp.getStage(), score));
-            pred.setRiskLevel(calculateRisk(driver, gp));
-
-            // Формируем JSON с аргументами (объяснимый ИИ)
-            pred.setArguments(formArguments(driver, gp));
+            pred.setConfidence(calculateConfidence(stage, score));
+            pred.setRiskLevel(calculateRisk(hasPenalty, gp, gridScore));
+            pred.setArguments(formArguments(overallHistScore, trackHistScore, newsScore, hasPenalty));
 
             predictions.add(pred);
         }
@@ -74,103 +101,74 @@ public class PredictionService {
         return predictionRepo.saveAll(predictions);
     }
 
-    private Double calculateConfidence(String stage, Double score) {
-        // TODO: Разработать логичный способ определения уверенности без magic numbers
-        double baseConfidence = 0.4;
-        if ("FP_DONE".equals(stage)) baseConfidence = 0.6;
-        if ("QUALI_DONE".equals(stage)) baseConfidence = 0.85;
-        if (score > 90) baseConfidence = 0.9;
-        return baseConfidence;
-    }
+    // --- МЕТОДЫ РАСЧЕТА ---
 
-    private String calculateRisk(Driver driver, GrandPrix gp) {
-        // TODO:  Логика: если есть штрафы из новостей или гонка в Монако (сложно обгонять)
-        //  возвращаем "HIGH", иначе "MEDIUM" или "LOW"
+    private double calculateScore(String stage, double overallHistScore, double trackHistScore, double newsScore, double paceScore, double gridScore, boolean hasPenalty) {
+        double score = 0.0;
 
-        return "MEDIUM";
-    }
-
-    private String formArguments(Driver driver, GrandPrix gp) {
-        // TODO: Формируем аргументы на основе истории выступления пилота и новостей
-        // "Средняя позиция в последних гонках: 2.3 (Score: 88). На этом треке в среднем финишировал: 4.5 (Score: 77)."
-        return "{\"history\": \"Ср. место: 3.2\", \"news\": \"+0.5 (Позитив)\"}";
-    }
-
-    private double calculateScore(Driver driver, GrandPrix gp) {
-        double score = 0;
-        String stage = gp.getStage();
-
-        // --- 1. Исторические данные ---
-        double overallHistScore = calculateOverallHistoryScore(driver.getId(), driver.getTeam());
-        double trackHistScore = calculateTrackHistoryScore(driver.getId(), gp.getName());
-
-        // --- 2. Новости ---
-        // Берем ВСЕ новости Гран-при
-        List<News> gpNews = newsRepo.findByGrandPrix_Id(gp.getId());
-
-        // Фильтруем: оставляем только те, где упоминается наш пилот
-        List<News> driverNews = gpNews.stream()
-                .filter(n -> n.getMentionedDrivers() != null &&
-                        Arrays.asList(n.getMentionedDrivers()).contains(driver.getName()))
-                .toList();
-
-        // Считаем среднюю тональность ТОЛЬКО по новостям пилота
-        double avgSentiment = driverNews.stream()
-                .mapToDouble(News::getSentimentScore)
-                .average().orElse(0.0);
-
-        // Проверяем штрафы (риск) в новостях пилота
-        boolean hasPenalty = driverNews.stream()
-                .anyMatch(n -> n.getRiskKeywords() != null && n.getRiskKeywords().length > 0);
-
-
-
-        // --- 3. Практики и Квалификация ---
-        double paceScore = 0.0;
-        double gridScore = 0.0;
-
-        if (stage.equals("FP_DONE") || stage.equals("QUALI_DONE")) {
-            PracticeResult pr = practiceRepo.findTopByGrandPrix_IdAndDriver_IdOrderByLapTimeMsAsc(gp.getId(), driver.getId());
-            if (pr != null) {
-                paceScore = Math.max(0, 100 - (pr.getGapToP1Ms() / 1000.0) * 10);
-            }
-        }
-
-        if (stage.equals("QUALI_DONE")) {
-            QualifyingResult qr = qualiRepo.findByGrandPrix_IdAndDriver_Id(gp.getId(), driver.getId());
-            if (qr != null) {
-                gridScore = Math.max(0, 100 - ((qr.getPosition() - 1) * 5));
-            }
-        }
-
-        // --- ВЗВЕШИВАНИЕ (SCORING) ---
-        // Теперь логика прозрачная: цифры сходятся по стадиям.
-
-        if (stage.equals("UPCOMING")) {
-            // До уикенда: 50% общая история + 20% история трека + 30% новости
-            score = (overallHistScore * 0.5) + (trackHistScore * 0.2) + (avgSentiment * 20 * 0.3);
-        } else if (stage.equals("FP_DONE")) {
-            // После практик: 30% общая история + 10% история трека + 20% новости + 40% темп в практике
-            score = (overallHistScore * 0.3) + (trackHistScore * 0.1) + (avgSentiment * 20 * 0.2) + (paceScore * 0.4);
-        } else if (stage.equals("QUALI_DONE")) {
-            // После квалификации: 20% общая история + 10% история трека + 10% новости + 20% темп + 40% стартовая решетка
-            score = (overallHistScore * 0.2) + (trackHistScore * 0.1) + (avgSentiment * 20 * 0.1) + (paceScore * 0.2) + (gridScore * 0.4);
+        if ("UPCOMING".equals(stage)) {
+            score = (overallHistScore * 0.5) + (trackHistScore * 0.2) + (newsScore * 0.3);
+        } else if ("FP_DONE".equals(stage)) {
+            score = (overallHistScore * 0.3) + (trackHistScore * 0.1) + (newsScore * 0.2) + (paceScore * 0.4);
+        } else if ("QUALI_DONE".equals(stage)) {
+            score = (overallHistScore * 0.2) + (trackHistScore * 0.1) + (newsScore * 0.1) + (paceScore * 0.2) + (gridScore * 0.4);
         }
 
         if (hasPenalty) score -= 15; // Штраф за риск из новостей
         return Math.max(0, Math.min(100, score));
     }
 
-    // Расчет среднего места за всю историю пилота (нормализованный)
+    private Double calculateConfidence(String stage, Double score) {
+        double baseConfidence = 0.4;
+        if ("FP_DONE".equals(stage)) baseConfidence = 0.6;
+        if ("QUALI_DONE".equals(stage)) baseConfidence = 0.85;
+
+        // Бонус к уверенности, если пилот имеет явный перевес в скоринге
+        if (score > 90) baseConfidence = Math.min(1.0, baseConfidence + 0.05);
+
+        return baseConfidence;
+    }
+
+    private String calculateRisk(boolean hasPenalty, GrandPrix gp, double gridScore) {
+        // Если есть штрафы или авария в новостях — риск высокий
+        if (hasPenalty) return "HIGH";
+
+        // Если трасса узкая (как Монако) и пилот стартует далеко (gridScore < 50, т.е. хуже 10-го места)
+        if (gp.getName().toLowerCase().contains("monaco") && gridScore > 0 && gridScore < 50) {
+            return "HIGH";
+        }
+
+        // Если стадия ранняя, данных мало — риск средний
+        if ("UPCOMING".equals(gp.getStage())) return "MEDIUM";
+
+        return "LOW";
+    }
+
+    private String formArguments(double overallHistScore, double trackHistScore, double newsScore, boolean hasPenalty) {
+        // Формируем понятный JSON для фронтенда
+        String newsExplanation;
+        if (newsScore == 50.0 && !hasPenalty) {
+            newsExplanation = "Релевантных новостей не найдено. Использован нейтральный коэффициент (50/100).";
+        } else {
+            newsExplanation = String.format("Влияние новостей: %.1f/100. Наличие рисков (штрафы/аварии): %b", newsScore, hasPenalty);
+        }
+
+        return String.format(
+                "{\"overallHistory\": \"Общая история: %.1f/100\", " +
+                        "\"trackHistory\": \"История на треке: %.1f/100\", " +
+                        "\"news\": \"%s\"}",
+                overallHistScore, trackHistScore, newsExplanation
+        );
+    }
+
     private double calculateOverallHistoryScore(Long driverId, String teamName) {
         List<HistoricalResult> results = histRepo.findByDriver_Id(driverId);
 
         if (results.isEmpty()) {
-            // Если пилот новичок, берем средний результат команды в этом сезоне
             results = histRepo.findByTeamName(teamName);
         }
 
-        if (results.isEmpty()) return 50.0; // Абсолютный дефолт, если данных по команде нет
+        if (results.isEmpty()) return 50.0;
 
         double avgPos = results.stream()
                 .mapToInt(HistoricalResult::getFinalPosition)
@@ -179,10 +177,9 @@ public class PredictionService {
         return Math.max(0, 100 - ((avgPos - 1) * 5));
     }
 
-    // Расчет среднего места на конкретном треке (например, Ферстаппен в Монако)
     private double calculateTrackHistoryScore(Long driverId, String gpName) {
         List<HistoricalResult> results = histRepo.findByDriver_IdAndGpName(driverId, gpName);
-        if (results.isEmpty()) return 50.0; // Если пилот никогда здесь не ездил
+        if (results.isEmpty()) return 50.0;
 
         double avgPos = results.stream()
                 .mapToInt(HistoricalResult::getFinalPosition)
@@ -190,5 +187,4 @@ public class PredictionService {
 
         return Math.max(0, 100 - ((avgPos - 1) * 5));
     }
-
 }

@@ -13,7 +13,7 @@ import java.time.LocalDateTime;
 public class GrandPrix {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.SEQUENCE)
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
     @Column(name = "name", length = 100)

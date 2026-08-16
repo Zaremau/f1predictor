@@ -6,4 +6,6 @@ import org.springframework.data.jpa.repository.JpaRepository;
 public interface PracticeRepository extends JpaRepository<PracticeResult, Long> {
 
     PracticeResult findTopByGrandPrix_IdAndDriver_IdOrderByLapTimeMsAsc(Long gpId, Long driverId);
+
+    CharSequence findByGrandPrix_Id(Long grandPrixId);
 }

@@ -6,4 +6,6 @@ import org.springframework.data.jpa.repository.JpaRepository;
 public interface QualifyingRepository extends JpaRepository<QualifyingResult, Long> {
 
     QualifyingResult findByGrandPrix_IdAndDriver_Id(Long gpId, Long driverId);
+
+    CharSequence findByGrandPrix_Id(Long grnadPrixId);
 }

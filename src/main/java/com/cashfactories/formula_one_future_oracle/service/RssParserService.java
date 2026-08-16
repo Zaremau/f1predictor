@@ -85,8 +85,13 @@ public class RssParserService {
                     String title = element.getElementsByTagName("title").item(0).getTextContent();
                     String link = element.getElementsByTagName("link").item(0).getTextContent();
 
-                    // Проверяем, есть ли уже такая новость в БД (чтобы не дублировать)
-                    if (newsRepo.existsByUrl(link)) {
+                    // --- НОВАЯ ПРОВЕРКА: РЕЛЕВАТНОСТЬ НОВОСТИ ГРАН-ПРИ ---
+                    if (!isNewsRelevant(title, gp)) {
+                        continue; // Если новость не про этот Гран-при, пропускаем её
+                    }
+
+                    // Проверяем, есть ли уже такая новость в БД для этого Гран-при (чтобы не дублировать)
+                    if (newsRepo.existsByGrandPrix_IdAndUrl(gp.getId(), link)) {
                         continue;
                     }
 
@@ -106,6 +111,25 @@ public class RssParserService {
         } catch (Exception e) {
             System.err.println("Ошибка парсинга XML: " + e.getMessage());
         }
+    }
+
+    /**
+     * Метод проверяет, связана ли новость с конкретным Гран-при
+     */
+    private boolean isNewsRelevant(String title, GrandPrix gp) {
+        if (title == null || title.isEmpty()) return false;
+
+        String lowerTitle = title.toLowerCase();
+
+        // Получаем ключевые слова из Гран-при
+        String gpName = gp.getName().toLowerCase(); // например "monaco grand prix"
+        String country = gp.getCountry().toLowerCase(); // например "monaco"
+
+        // Убираем слова "grand prix" чтобы искать просто по "monaco" или "spain"
+        String mainKeyword = gpName.replace("grand prix", "").trim();
+
+        // Если в заголовке есть название страны или ключевое слово трассы — новость релевантна
+        return lowerTitle.contains(mainKeyword) || lowerTitle.contains(country);
     }
 
     /**

@@ -12,4 +12,6 @@ public interface NewsRepository extends JpaRepository<News, Long> {
     List<News> findByGrandPrix_Id(Long id);
 
     boolean existsByUrl(String link);
+
+    boolean existsByGrandPrix_IdAndUrl(Long grandPrixId, String link);
 }
