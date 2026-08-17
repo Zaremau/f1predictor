@@ -7,6 +7,7 @@ import com.cashfactories.formula_one_future_oracle.repository.DriverRepository;
 import com.cashfactories.formula_one_future_oracle.repository.GrandPrixRepository;
 import com.cashfactories.formula_one_future_oracle.repository.NewsRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.w3c.dom.Document;
@@ -26,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class RssParserService {
 
     private final NewsRepository newsRepo;
@@ -33,18 +35,15 @@ public class RssParserService {
     private final DriverRepository driverRepo;
     private final RestTemplate restTemplate = new RestTemplate();
 
-    // Наши RSS ленты
     private static final String[] RSS_FEEDS = {
             "https://www.motorsport.com/rss/f1/news/",
             "https://www.formel1.de/rss.xml"
     };
 
-    // Список стоп-слов для рисков
     private static final List<String> RISK_KEYWORDS = Arrays.asList(
             "grid penalty", "engine penalty", "gearbox", "crash", "rain", "weather", "damage", "dnf"
     );
 
-    // Путь к скрипту внутри Docker-контейнера
     private static final String PYTHON_SCRIPT_PATH = "/app/python-sentiment/sentiment.py";
 
     /**
@@ -59,7 +58,7 @@ public class RssParserService {
                 String xmlData = restTemplate.getForObject(url, String.class);
                 parseAndSaveXml(xmlData, gp);
             } catch (Exception e) {
-                System.err.println("Ошибка при получении RSS ленты " + url + ": " + e.getMessage());
+                log.error("Ошибка при получении RSS ленты {}: {}", url, e.getMessage());
             }
         }
 
@@ -67,7 +66,7 @@ public class RssParserService {
     }
 
     /**
-     * Парсим XML и сохраняем сырые новости в БД
+     * Парсит XML и сохраняет сырые новости в БД
      */
     private void parseAndSaveXml(String xmlData, GrandPrix gp) {
         try {
@@ -85,17 +84,14 @@ public class RssParserService {
                     String title = element.getElementsByTagName("title").item(0).getTextContent();
                     String link = element.getElementsByTagName("link").item(0).getTextContent();
 
-                    // --- НОВАЯ ПРОВЕРКА: РЕЛЕВАТНОСТЬ НОВОСТИ ГРАН-ПРИ ---
                     if (!isNewsRelevant(title, gp)) {
                         continue; // Если новость не про этот Гран-при, пропускаем её
                     }
 
-                    // Проверяем, есть ли уже такая новость в БД для этого Гран-при (чтобы не дублировать)
                     if (newsRepo.existsByGrandPrix_IdAndUrl(gp.getId(), link)) {
                         continue;
                     }
 
-                    // Сохраняем сырую новость
                     News news = new News();
                     news.setGrandPrix(gp);
                     news.setTitle(title);
@@ -109,7 +105,7 @@ public class RssParserService {
                 }
             }
         } catch (Exception e) {
-            System.err.println("Ошибка парсинга XML: " + e.getMessage());
+            log.error("Ошибка парсинга XML: {}", e.getMessage());
         }
     }
 
@@ -120,15 +116,10 @@ public class RssParserService {
         if (title == null || title.isEmpty()) return false;
 
         String lowerTitle = title.toLowerCase();
-
-        // Получаем ключевые слова из Гран-при
-        String gpName = gp.getName().toLowerCase(); // например "monaco grand prix"
-        String country = gp.getCountry().toLowerCase(); // например "monaco"
-
-        // Убираем слова "grand prix" чтобы искать просто по "monaco" или "spain"
+        String gpName = gp.getName().toLowerCase();
+        String country = gp.getCountry().toLowerCase();
         String mainKeyword = gpName.replace("grand prix", "").trim();
 
-        // Если в заголовке есть название страны или ключевое слово трассы — новость релевантна
         return lowerTitle.contains(mainKeyword) || lowerTitle.contains(country);
     }
 
@@ -140,15 +131,12 @@ public class RssParserService {
         List<Driver> allDrivers = driverRepo.findAll(); // Получаем всех пилотов из БД
 
         for (News news : unprocessed) {
-            // 1. Python Sentiment Analysis
             double sentiment = callPythonSentiment(news.getTitle());
             news.setSentimentScore(sentiment);
 
-            // 2. Java Regex for Risk Keywords
             String[] keywords = checkRiskKeywords(news.getTitle());
             news.setRiskKeywords(keywords);
 
-            // 3. Ищем имена пилотов в тексте
             String[] mentionedDrivers = findMentionedDrivers(news.getTitle(), allDrivers);
             news.setMentionedDrivers(mentionedDrivers);
 
@@ -157,7 +145,6 @@ public class RssParserService {
         }
     }
 
-    // --- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ---
 
     private String extractSourceFromUrl(String url) {
         if (url.contains("motorsport.com")) return "motorsport.com";
@@ -173,17 +160,19 @@ public class RssParserService {
                 .toArray(String[]::new);
     }
 
+    /**
+     * Определяет тональность новости
+     * @param text - текст новости
+     * @return оценка тональности от -1 до 1
+     */
     private double callPythonSentiment(String text) {
         try {
-            // Формируем команду: python3 /app/python-sentiment/sentiment.py "Текст новости"
             ProcessBuilder pb = new ProcessBuilder("python3", PYTHON_SCRIPT_PATH, text);
             Process process = pb.start();
 
-            // Читаем ответ из консоли
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                 String result = reader.readLine();
 
-                // Ждем завершения процесса (таймаут 5 секунд, чтобы не зависнуть)
                 boolean finished = process.waitFor(5, TimeUnit.SECONDS);
                 if (!finished) {
                     process.destroyForcibly();
@@ -195,10 +184,9 @@ public class RssParserService {
                 }
             }
         } catch (Exception e) {
-            // Логируем ошибку, но не роняем приложение, просто возвращаем нейтральный 0.0
-            System.err.println("Ошибка вызова Python скрипта: " + e.getMessage());
+            log.error("Ошибка вызова Python скрипта: {}", e.getMessage());
         }
-        return 0.0; // Если что-то пошло не так, возвращаем нейтральную тональность
+        return 0.0;
     }
 
     private String[] checkRiskKeywords(String text) {
@@ -206,7 +194,6 @@ public class RssParserService {
 
         String lowerText = text.toLowerCase();
 
-        // Фильтруем список: оставляем только те слова, которые есть в тексте
         return RISK_KEYWORDS.stream()
                 .filter(lowerText::contains)
                 .toArray(String[]::new);

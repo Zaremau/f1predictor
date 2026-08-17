@@ -45,7 +45,7 @@ class PredictionServiceTest {
 
     @Test
     void generatePredictions_WhenUpcomingStage_ShouldCalculateBasedOnHistoryAndNews() {
-        // Arrange (Подготовка данных)
+        // Arrange
         when(gpRepo.findById(1L)).thenReturn(Optional.of(testGp));
         when(driverRepo.findAll()).thenReturn(List.of(testDriver));
 

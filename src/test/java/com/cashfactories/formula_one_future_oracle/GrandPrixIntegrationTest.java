@@ -24,7 +24,6 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @Testcontainers
 class GrandPrixIntegrationTest {
 
-    // Testcontainers сам скачает образ Postgres 15 и запустит его на свободном порту
     @Container
     public static PostgreSQLContainer<?> postgreSQLContainer = new PostgreSQLContainer<>("postgres:15")
             .withDatabaseName("testdb")
@@ -36,18 +35,15 @@ class GrandPrixIntegrationTest {
     @Autowired private GrandPrixRepository grandPrixRepository;
     @Autowired private PredictionRepository predictionRepository;
 
-    // Мокаем внешний сервис, чтобы во время тестов не идти в интернет
     @MockitoBean
     private OpenF1Service openF1Service;
 
     @BeforeEach
     void setUp() {
-        // Очищаем базу перед каждым тестом
         predictionRepository.deleteAll();
         grandPrixRepository.deleteAll();
         driverRepository.deleteAll();
 
-        // Наполняем базу тестовыми данными напрямую через репозитории
         Driver driver = driverRepository.save(Driver.builder().name("Lando Norris").team("McLaren").driverNumber(4).build());
 
         GrandPrix gp = GrandPrix.builder()
@@ -69,7 +65,6 @@ class GrandPrixIntegrationTest {
 
     @Test
     void getGrandPrixData_WhenUpcoming_ShouldReturnPredictions() throws Exception {
-        // Получаем ID созданного Гран-при
         Long gpId = grandPrixRepository.findAll().get(0).getId();
 
         mockMvc.perform(get("/api/grand-prix/{id}/data", gpId))
