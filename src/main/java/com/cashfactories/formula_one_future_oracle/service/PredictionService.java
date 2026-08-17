@@ -118,15 +118,25 @@ public class PredictionService {
         return Math.max(0, Math.min(100, score));
     }
 
+    /**
+     * Определяет уверенность в прогнозе зависимости от этапа и оценки
+     * @param stage - этап гран-при
+     * @param score - оценка пилота
+     * @return уверенность в прогнозе
+     */
     private Double calculateConfidence(String stage, Double score) {
+        // Базовая уверенность зависит от стадии (чем больше данных, тем выше база)
         double baseConfidence = 0.4;
         if ("FP_DONE".equals(stage)) baseConfidence = 0.6;
         if ("QUALI_DONE".equals(stage)) baseConfidence = 0.85;
 
-        // Бонус к уверенности, если пилот имеет явный перевес в скоринге
-        if (score > 90) baseConfidence = Math.min(1.0, baseConfidence + 0.05);
+        // НОВОЕ: Динамический бонус. Чем выше скор, тем больше уверенность.
+        // Например, при score=90 добавим +0.15, при score=50 добавим 0.
+        double scoreBonus = (score / 100.0) * 0.15;
 
-        return baseConfidence;
+        double confidence = baseConfidence + scoreBonus;
+
+        return Math.min(0.99, confidence);
     }
 
     private String calculateRisk(boolean hasPenalty, GrandPrix gp, double gridScore) {
@@ -145,17 +155,16 @@ public class PredictionService {
     }
 
     private String formArguments(double overallHistScore, double trackHistScore, double newsScore, boolean hasPenalty) {
-        // Формируем понятный JSON для фронтенда
         String newsExplanation;
         if (newsScore == 50.0 && !hasPenalty) {
             newsExplanation = "Релевантных новостей не найдено. Использован нейтральный коэффициент (50/100).";
         } else {
-            newsExplanation = String.format("Влияние новостей: %.1f/100. Наличие рисков (штрафы/аварии): %b", newsScore, hasPenalty);
+            newsExplanation = String.format("Влияние новостей: %.1f/100. Наличие рисков: %b", newsScore, hasPenalty);
         }
 
         return String.format(
-                "{\"overallHistory\": \"Общая история: %.1f/100\", " +
-                        "\"trackHistory\": \"История на треке: %.1f/100\", " +
+                "{\"overallHistory\": \"%.1f/100\", " +
+                        "\"trackHistory\": \"%.1f/100\", " +
                         "\"news\": \"%s\"}",
                 overallHistScore, trackHistScore, newsExplanation
         );

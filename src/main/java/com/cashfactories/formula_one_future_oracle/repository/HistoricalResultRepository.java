@@ -13,4 +13,5 @@ public interface HistoricalResultRepository extends JpaRepository<HistoricalResu
 
     List<HistoricalResult> findByTeamName(String teamName);
 
+    boolean existsByGpName(String gpName);
 }

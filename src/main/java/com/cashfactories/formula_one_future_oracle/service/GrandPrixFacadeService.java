@@ -37,7 +37,8 @@ public class GrandPrixFacadeService {
         if ("RACE_DONE".equals(gp.getStage())) {
             return getRaceResults(gpId);
         }
-
+        // Паузы из-за лимита OpenF1 API
+        try { Thread.sleep(400); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         // --- 2. Если гонка еще не прошла ---
         // Сначала синхронизируем статус (вдруг прошла квалификация)
         openF1Service.syncGrandPrixData(gpId);
@@ -56,6 +57,7 @@ public class GrandPrixFacadeService {
             if (!existingPredictions.isEmpty()) {
                 predictionRepo.deleteAll(existingPredictions); // Удаляем устаревший прогноз
             }
+            openF1Service.fetchHistoryForGrandPrix(updatedGp);
             existingPredictions = predictionService.generatePredictions(gpId); // Считаем заново
         }
 

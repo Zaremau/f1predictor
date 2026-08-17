@@ -1,7 +1,9 @@
 package com.cashfactories.formula_one_future_oracle.config;
 
-import com.cashfactories.formula_one_future_oracle.model.*;
-import com.cashfactories.formula_one_future_oracle.repository.*;
+import com.cashfactories.formula_one_future_oracle.model.Driver;
+import com.cashfactories.formula_one_future_oracle.model.GrandPrix;
+import com.cashfactories.formula_one_future_oracle.repository.DriverRepository;
+import com.cashfactories.formula_one_future_oracle.repository.GrandPrixRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -11,8 +13,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.Map;
 
 @Component
 @RequiredArgsConstructor
@@ -21,8 +21,6 @@ public class DataSeeder implements CommandLineRunner {
 
     private final DriverRepository driverRepo;
     private final GrandPrixRepository gpRepo;
-    private final HistoricalResultRepository histRepo;
-    private final ActualResultRepository actualResultRepo;
 
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -36,80 +34,36 @@ public class DataSeeder implements CommandLineRunner {
             return;
         }
 
-        log.info("=== Начало инициализации данных (Системная дата: 2026 год) ===");
+        log.info("=== Начало инициализации данных (Системная дата: {} год) ===", LocalDateTime.now().getYear());
         try {
-            seedRealDriversAndHistoryFromOpenF1();
-            log.info("=== Реальные данные из OpenF1 загружены ===");
+            // Пытаемся скачать реальный состав пилотов сезона
+            seedRealDriversFromOpenF1();
+            log.info("=== Реальные пилоты из OpenF1 загружены ===");
         } catch (Exception e) {
-            log.warn("!!! Не удалось получить полную историю из OpenF1: {}. Используем Fallback для истории.", e.getMessage());
-            seedFallbackHistory();
+            log.warn("!!! Не удалось получить пилотов из OpenF1: {}. Используем Fallback.", e.getMessage());
+            seedFallbackDrivers();
         }
 
-        // В любом случае загружаем календарь 2026 года
+        // Загружаем календарь текущего года (2026)
         seedCalendar2026();
-        log.info("=== Инициализация завершена ===");
+        log.info("=== Инициализация завершена успешно ===");
     }
 
-    // 1. Скачиваем пилотов и последние гонки из OpenF1
-    private void seedRealDriversAndHistoryFromOpenF1() throws Exception {
-        if (driverRepo.count() == 0) {
-            log.info("Запрос пилотов из OpenF1...");
-            String json = restTemplate.getForObject(OPENF1_BASE + "/drivers?session_key=latest", String.class);
-            JsonNode root = objectMapper.readTree(json);
+    // 1. Скачиваем только пилотов (это быстро)
+    private void seedRealDriversFromOpenF1() throws Exception {
+        log.info("Запрос пилотов из OpenF1...");
+        String json = restTemplate.getForObject(OPENF1_BASE + "/drivers?session_key=latest", String.class);
+        JsonNode root = objectMapper.readTree(json);
+        log.info("Получено пилотов из API: {}", root.size());
 
-            for (JsonNode node : root) {
-                driverRepo.save(Driver.builder()
-                        .name(node.get("full_name").asText())
-                        .team(node.get("team_name").asText())
-                        .driverNumber(node.get("driver_number").asInt())
-                        .build());
-            }
-        }
-
-        log.info("Запрос исторических результатов (сезон 2024) из OpenF1...");
-        // Ограничиваем сезон 2024 года, чтобы не скачать гигантский JSON за всю историю Ф1
-        String sessionsJson = restTemplate.getForObject(OPENF1_BASE + "/sessions?session_name=Race&year=2024", String.class);
-        JsonNode sessions = objectMapper.readTree(sessionsJson);
-
-        // Берем первые 3 гонки сезона 2024 для исторических данных
-        int racesToFetch = Math.min(3, sessions.size());
-        for (int i = 0; i < racesToFetch; i++) {
-            JsonNode raceSession = sessions.get(i);
-            int sessionKey = raceSession.get("session_key").asInt();
-            String gpName = raceSession.get("meeting_name").asText();
-            int season = raceSession.get("year").asInt();
-
-            String posJson = restTemplate.getForObject(OPENF1_BASE + "/position?session_key=" + sessionKey, String.class);
-            JsonNode positions = objectMapper.readTree(posJson);
-
-            Map<Integer, Integer> finalPositions = new HashMap<>();
-            Map<Integer, String> latestDates = new HashMap<>();
-
-            for (JsonNode posNode : positions) {
-                int drvNum = posNode.get("driver_number").asInt();
-                String date = posNode.get("date").asText();
-                int pos = posNode.get("position").asInt();
-
-                if (!latestDates.containsKey(drvNum) || date.compareTo(latestDates.get(drvNum)) > 0) {
-                    latestDates.put(drvNum, date);
-                    finalPositions.put(drvNum, pos);
-                }
-            }
-
-            for (Map.Entry<Integer, Integer> entry : finalPositions.entrySet()) {
-                int drvNum = entry.getKey();
-                int finalPos = entry.getValue();
-
-                driverRepo.findByDriverNumber(drvNum).ifPresent(driver -> {
-                    histRepo.save(HistoricalResult.builder()
-                            .driver(driver)
-                            .gpName(gpName)
-                            .season(season)
-                            .finalPosition(finalPos)
-                            .teamName(driver.getTeam())
-                            .build());
-                });
-            }
+        for (JsonNode node : root) {
+            // Используем path() чтобы не падать, если поля нет в JSON
+            Driver driver = Driver.builder()
+                    .name(node.path("full_name").asText("Unknown Driver"))
+                    .team(node.path("team_name").asText("Unknown Team"))
+                    .driverNumber(node.path("driver_number").asInt(0))
+                    .build();
+            driverRepo.save(driver);
         }
     }
 
@@ -118,6 +72,7 @@ public class DataSeeder implements CommandLineRunner {
         log.info("Загрузка календаря 2026 года...");
         LocalDateTime now = LocalDateTime.now();
 
+        // Гонки, которые УЖЕ прошли (до августа 2026)
         gpRepo.save(GrandPrix.builder().name("Bahrain Grand Prix").country("Bahrain").raceDate(now.minusDays(140)).stage("RACE_DONE").build());
         gpRepo.save(GrandPrix.builder().name("Saudi Arabian Grand Prix").country("Saudi Arabia").raceDate(now.minusDays(130)).stage("RACE_DONE").build());
         gpRepo.save(GrandPrix.builder().name("Australian Grand Prix").country("Australia").raceDate(now.minusDays(120)).stage("RACE_DONE").build());
@@ -133,6 +88,7 @@ public class DataSeeder implements CommandLineRunner {
         gpRepo.save(GrandPrix.builder().name("Hungarian Grand Prix").country("Hungary").raceDate(now.minusDays(20)).stage("RACE_DONE").build());
         gpRepo.save(GrandPrix.builder().name("Belgian Grand Prix").country("Belgium").raceDate(now.minusDays(10)).stage("RACE_DONE").build());
 
+        // Гонки, которые ПЛАНИРУЕТСЯ ПРОВЕСТИ (после августа 2026)
         gpRepo.save(GrandPrix.builder().name("Dutch Grand Prix").country("Netherlands").raceDate(now.plusDays(5)).stage("UPCOMING").build());
         gpRepo.save(GrandPrix.builder().name("Italian Grand Prix").country("Italy").raceDate(now.plusDays(15)).stage("UPCOMING").build());
         gpRepo.save(GrandPrix.builder().name("Azerbaijan Grand Prix").country("Azerbaijan").raceDate(now.plusDays(25)).stage("UPCOMING").build());
@@ -145,27 +101,28 @@ public class DataSeeder implements CommandLineRunner {
         gpRepo.save(GrandPrix.builder().name("Abu Dhabi Grand Prix").country("UAE").raceDate(now.plusDays(95)).stage("UPCOMING").build());
     }
 
-    // 3. Безопасный Fallback (не падает с ошибкой Duplicate Key)
-    private void seedFallbackHistory() {
-        log.info("Загрузка резервной истории (если пилоты есть, они не дублируются)...");
-
-        // Получаем Ферстаппена (если он уже скачался из API)
-        Driver verstappen = driverRepo.findByDriverNumber(1).orElseGet(() ->
-                driverRepo.save(Driver.builder().name("Max Verstappen").team("Red Bull Racing").driverNumber(1).build())
-        );
-        // Получаем Норриса
-        Driver norris = driverRepo.findByDriverNumber(4).orElseGet(() ->
-                driverRepo.save(Driver.builder().name("Lando Norris").team("McLaren").driverNumber(4).build())
-        );
-        // Получаем Хэмилтона
-        Driver hamilton = driverRepo.findByDriverNumber(44).orElseGet(() ->
-                driverRepo.save(Driver.builder().name("Lewis Hamilton").team("Ferrari").driverNumber(44).build())
-        );
-
-        if (histRepo.count() == 0) {
-            histRepo.save(HistoricalResult.builder().driver(norris).gpName("Belgian Grand Prix").season(2025).finalPosition(1).teamName("McLaren").build());
-            histRepo.save(HistoricalResult.builder().driver(verstappen).gpName("Belgian Grand Prix").season(2025).finalPosition(2).teamName("Red Bull Racing").build());
-            histRepo.save(HistoricalResult.builder().driver(hamilton).gpName("Belgian Grand Prix").season(2025).finalPosition(3).teamName("Ferrari").build());
-        }
+    // 3. Fallback для пилотов (если OpenF1 недоступен)
+    private void seedFallbackDrivers() {
+        log.info("Загрузка резервных пилотов...");
+        driverRepo.save(Driver.builder().name("Max Verstappen").team("Red Bull Racing").driverNumber(1).build());
+        driverRepo.save(Driver.builder().name("Sergio Perez").team("Red Bull Racing").driverNumber(11).build());
+        driverRepo.save(Driver.builder().name("Charles Leclerc").team("Ferrari").driverNumber(16).build());
+        driverRepo.save(Driver.builder().name("Lewis Hamilton").team("Ferrari").driverNumber(44).build());
+        driverRepo.save(Driver.builder().name("Lando Norris").team("McLaren").driverNumber(4).build());
+        driverRepo.save(Driver.builder().name("Oscar Piastri").team("McLaren").driverNumber(81).build());
+        driverRepo.save(Driver.builder().name("George Russell").team("Mercedes").driverNumber(63).build());
+        driverRepo.save(Driver.builder().name("Kimi Antonelli").team("Mercedes").driverNumber(12).build());
+        driverRepo.save(Driver.builder().name("Fernando Alonso").team("Aston Martin").driverNumber(14).build());
+        driverRepo.save(Driver.builder().name("Lance Stroll").team("Aston Martin").driverNumber(18).build());
+        driverRepo.save(Driver.builder().name("Pierre Gasly").team("Alpine").driverNumber(10).build());
+        driverRepo.save(Driver.builder().name("Esteban Ocon").team("Alpine").driverNumber(31).build());
+        driverRepo.save(Driver.builder().name("Carlos Sainz").team("Williams").driverNumber(55).build());
+        driverRepo.save(Driver.builder().name("Alex Albon").team("Williams").driverNumber(23).build());
+        driverRepo.save(Driver.builder().name("Yuki Tsunoda").team("RB").driverNumber(22).build());
+        driverRepo.save(Driver.builder().name("Liam Lawson").team("RB").driverNumber(30).build());
+        driverRepo.save(Driver.builder().name("Nico Hulkenberg").team("Haas").driverNumber(27).build());
+        driverRepo.save(Driver.builder().name("Valtteri Bottas").team("Kick Sauber").driverNumber(77).build());
+        driverRepo.save(Driver.builder().name("Zhou Guanyu").team("Kick Sauber").driverNumber(24).build());
+        driverRepo.save(Driver.builder().name("Franco Colapinto").team("Kick Sauber").driverNumber(43).build());
     }
 }

@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.client.RestTemplate;
@@ -19,7 +20,7 @@ import java.util.*;
 @Slf4j
 public class OpenF1Service {
 
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate restTemplate = new RestTemplate(getClientHttpRequestFactory());
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final GrandPrixRepository gpRepo;
@@ -28,6 +29,15 @@ public class OpenF1Service {
     private final PracticeRepository practiceRepo;
     private final ActualResultRepository actualResultRepo;
     private final PredictionRepository predictionRepo;
+    private final HistoricalResultRepository histRepo;
+
+    // Настройка таймаутов
+    private SimpleClientHttpRequestFactory getClientHttpRequestFactory() {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(3000);
+        factory.setReadTimeout(3000);
+        return factory;
+    }
 
     private static final String BASE_URL = "https://api.openf1.org/v1";
 
@@ -225,5 +235,104 @@ public class OpenF1Service {
             }
         }
         return finalPositions;
+    }
+
+    /**
+     * Ленивая загрузка: пытается скачать реальные данные, но если они слишком большие (таймаут 3 сек),
+     * переключается на генерацию реалистичной заглушки.
+     */
+    @Transactional
+    public void fetchHistoryForGrandPrix(GrandPrix gp) {
+        if (histRepo.existsByGpName(gp.getName())) {
+            log.info("История для {} уже загружена.", gp.getName());
+            return;
+        }
+
+        log.info("Попытка скачать историю из OpenF1 для {}...", gp.getName());
+        int currentYear = LocalDateTime.now().getYear();
+        int downloadedCount = 0;
+
+        for (int year = currentYear - 1; year >= currentYear - 3; year--) {
+            try {
+                // 1. Скачиваем список гонок (это быстро, весит пару КБ)
+                String sessionsJson = restTemplate.getForObject(BASE_URL + "/sessions?session_name=Race&year=" + year, String.class);
+                JsonNode sessions = objectMapper.readTree(sessionsJson);
+
+                if (sessions == null || sessions.size() == 0) continue;
+
+                for (JsonNode session : sessions) {
+                    String countryName = session.path("country_name").asText();
+
+                    if (countryName.equalsIgnoreCase(gp.getCountry())) {
+                        int sessionKey = session.path("session_key").asInt();
+                        log.info("Найдена гонка: {} ({}). Запрос позиций...", countryName, year);
+
+                        // 2. Пытаемся скачать позиции (здесь может случиться таймаут из-за размера файла)
+                        String posJson = restTemplate.getForObject(BASE_URL + "/position?session_key=" + sessionKey, String.class);
+                        JsonNode positions = objectMapper.readTree(posJson);
+
+                        Map<Integer, Integer> finalPositions = getFinalPositions(positions);
+                        downloadedCount += finalPositions.size();
+
+                        for (Map.Entry<Integer, Integer> entry : finalPositions.entrySet()) {
+                            int finalYear = year;
+                            driverRepo.findByDriverNumber(entry.getKey()).ifPresent(driver -> {
+                                histRepo.save(HistoricalResult.builder()
+                                        .driver(driver)
+                                        .gpName(gp.getName())
+                                        .season(finalYear)
+                                        .finalPosition(entry.getValue())
+                                        .teamName(driver.getTeam())
+                                        .build());
+                            });
+                        }
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                // Если файл слишком большой (Read timed out) или обрыв связи (Unexpected end-of-input)
+                log.warn("Не удалось скачать/распарсить историю за {} год: {}. Файл слишком большой.", year, e.getClass().getSimpleName());
+            }
+        }
+
+        // 3. Если реальные данные не скачались, используем заглушку
+        if (downloadedCount == 0) {
+            log.warn("Данные из API недоступны. Генерируем реалистичную заглушку для {}.", gp.getName());
+            generateMockHistoryForGp(gp);
+        } else {
+            log.info("Успешно сохранено {} реальных результатов для {}.", downloadedCount, gp.getName());
+        }
+    }
+
+    private void generateMockHistoryForGp(GrandPrix gp) {
+        List<Driver> drivers = driverRepo.findAll();
+        int currentYear = LocalDateTime.now().getYear();
+
+        for (Driver driver : drivers) {
+            int pos = getMockPosition2026(driver);
+            histRepo.save(HistoricalResult.builder()
+                    .driver(driver)
+                    .gpName(gp.getName())
+                    .season(currentYear - 1)
+                    .finalPosition(pos)
+                    .teamName(driver.getTeam())
+                    .build());
+        }
+    }
+
+    private int getMockPosition2026(Driver driver) {
+        String team = driver.getTeam() == null ? "" : driver.getTeam();
+
+        if (team.contains("Mercedes")) {
+            return (int)(Math.random() * 2) + 1; // 1-2 место
+        } else if (team.contains("Ferrari")) {
+            return (int)(Math.random() * 2) + 3; // 3-4 место
+        } else if (team.contains("Red Bull") || team.contains("McLaren")) {
+            return (int)(Math.random() * 4) + 5; // 5-8 место
+        } else if (team.contains("Aston Martin")) {
+            return (int)(Math.random() * 2) + 19; // 19-20 место
+        } else {
+            return (int)(Math.random() * 10) + 9; // 9-18 место
+        }
     }
 }

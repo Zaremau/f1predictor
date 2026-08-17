@@ -13,6 +13,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 
 import java.time.LocalDateTime;
 
@@ -25,6 +26,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class GrandPrixIntegrationTest {
 
     @Container
+    @ServiceConnection
     public static PostgreSQLContainer<?> postgreSQLContainer = new PostgreSQLContainer<>("postgres:15")
             .withDatabaseName("testdb")
             .withUsername("test")
@@ -35,12 +37,17 @@ class GrandPrixIntegrationTest {
     @Autowired private GrandPrixRepository grandPrixRepository;
     @Autowired private PredictionRepository predictionRepository;
 
+    @Autowired private HistoricalResultRepository historicalResultRepository;
+    @Autowired private ActualResultRepository actualResultRepository;
+
     @MockitoBean
     private OpenF1Service openF1Service;
 
     @BeforeEach
     void setUp() {
+        actualResultRepository.deleteAll();
         predictionRepository.deleteAll();
+        historicalResultRepository.deleteAll();
         grandPrixRepository.deleteAll();
         driverRepository.deleteAll();
 
