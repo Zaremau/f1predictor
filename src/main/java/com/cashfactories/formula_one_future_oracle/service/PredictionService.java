@@ -2,6 +2,8 @@ package com.cashfactories.formula_one_future_oracle.service;
 
 import com.cashfactories.formula_one_future_oracle.model.*;
 import com.cashfactories.formula_one_future_oracle.repository.*;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,176 +26,731 @@ public class PredictionService {
     private final PredictionRepository predictionRepo;
 
     @Transactional
-    public List<Prediction> generatePredictions(Long gpId) {
-        GrandPrix gp = gpRepo.findById(gpId).orElseThrow();
-        List<Driver> drivers = driverRepo.findAll();
-        List<Prediction> predictions = new ArrayList<>();
+    public List<Prediction> generatePredictions(
+            Long gpId
+    ) {
 
-        // 1. Считаем score для каждого пилота
+        GrandPrix gp =
+                gpRepo.findById(gpId)
+                        .orElseThrow();
+
+        List<Driver> drivers =
+                driverRepo.findAll();
+
+        /*
+         * Новости одинаковы для всех пилотов.
+         * Загружаем один раз.
+         */
+        List<News> gpNews =
+                newsRepo.findByGrandPrix_Id(
+                        gp.getId()
+                );
+
+        int currentSeason =
+                gp.getRaceDate().getYear();
+
+        List<Prediction> predictions =
+                new ArrayList<>();
+
         for (Driver driver : drivers) {
 
-            // --- РАСЧЕТ МЕТРИК ---
-            double overallHistScore = calculateOverallHistoryScore(driver.getId(), driver.getTeam());
-            double trackHistScore = calculateTrackHistoryScore(driver.getId(), gp.getName());
+            // ==========================================
+            // 1. CURRENT SEASON
+            // ==========================================
 
-            // Новости
-            List<News> gpNews = newsRepo.findByGrandPrix_Id(gp.getId());
-            List<News> driverNews = gpNews.stream()
-                    .filter(n -> n.getMentionedDrivers() != null &&
-                            Arrays.asList(n.getMentionedDrivers()).contains(driver.getName()))
-                    .toList();
+            double seasonHistory =
+                    calculateSeasonHistoryScore(
+                            driver.getId(),
+                            currentSeason
+                    );
 
-            double newsScore = 50.0; // Нейтральный базовый уровень
-            if (!driverNews.isEmpty()) {
-                double avgSentiment = driverNews.stream()
-                        .mapToDouble(News::getSentimentScore)
-                        .average().orElse(0.0);
-                newsScore = 50 + (avgSentiment * 50); // Перевод из [-1.0...1.0] в [0...100]
-            }
-            boolean hasPenalty = driverNews.stream()
-                    .anyMatch(n -> n.getRiskKeywords() != null && n.getRiskKeywords().length > 0);
+            // ==========================================
+            // 2. TRACK HISTORY
+            // ==========================================
 
-            // Практики и Квалификация
-            double paceScore = 0.0;
-            double gridScore = 0.0;
-            String stage = gp.getStage();
+            double trackHistory =
+                    calculateTrackHistoryScore(
+                            driver.getId(),
+                            gp.getName(),
+                            currentSeason
+                    );
 
-            if ("FP_DONE".equals(stage) || "QUALI_DONE".equals(stage)) {
-                PracticeResult pr = practiceRepo.findTopByGrandPrix_IdAndDriver_IdOrderByLapTimeMsAsc(gp.getId(), driver.getId());
-                if (pr != null) {
-                    paceScore = Math.max(0, 100 - (pr.getGapToP1Ms() / 1000.0) * 10);
-                }
-            }
+            // ==========================================
+            // 3. NEWS
+            // ==========================================
 
-            if ("QUALI_DONE".equals(stage)) {
-                QualifyingResult qr = qualiRepo.findByGrandPrix_IdAndDriver_Id(gp.getId(), driver.getId());
-                if (qr != null) {
-                    gridScore = Math.max(0, 100 - ((qr.getPosition() - 1) * 5));
-                }
-            }
+            List<News> driverNews =
+                    gpNews.stream()
+                            .filter(news ->
+                                    news.getMentionedDrivers() != null
+                                            && Arrays.asList(
+                                            news.getMentionedDrivers()
+                                    ).contains(
+                                            driver.getName()
+                                    )
+                            )
+                            .toList();
 
-            // --- ИТОГОВЫЙ СКОР ---
-            double score = calculateScore(stage, overallHistScore, trackHistScore, newsScore, paceScore, gridScore, hasPenalty);
+            double newsScore =
+                    calculateNewsScore(driverNews);
 
-            // --- ФОРМИРОВАНИЕ ПРОГНОЗА ---
-            Prediction pred = new Prediction();
-            pred.setGrandPrix(gp);
-            pred.setDriver(driver);
-            pred.setStage(stage);
-            pred.setScore(score); // Временно кладем score в @Transient поле
+            boolean hasPenalty =
+                    driverNews.stream()
+                            .anyMatch(news ->
+                                    news.getRiskKeywords() != null
+                                            && news.getRiskKeywords().length > 0
+                            );
 
-            pred.setConfidence(calculateConfidence(stage, score));
-            pred.setRiskLevel(calculateRisk(hasPenalty, gp, gridScore));
-            pred.setArguments(formArguments(overallHistScore, trackHistScore, newsScore, hasPenalty));
+            // ==========================================
+            // 4. PRACTICE
+            // ==========================================
 
-            predictions.add(pred);
+            PracticeMetrics practice =
+                    calculatePracticeMetrics(
+                            gp,
+                            driver
+                    );
+
+            // ==========================================
+            // 5. QUALIFYING
+            // ==========================================
+
+            QualifyingMetrics qualifying =
+                    calculateQualifyingMetrics(
+                            gp,
+                            driver
+                    );
+
+            // ==========================================
+            // 6. FINAL SCORE
+            // ==========================================
+
+            double score =
+                    calculateScore(
+                            gp.getStage(),
+                            seasonHistory,
+                            trackHistory,
+                            newsScore,
+                            practice.score(),
+                            qualifying.score(),
+                            hasPenalty
+                    );
+
+            // ==========================================
+            // 7. CONFIDENCE
+            // ==========================================
+
+            double confidence =
+                    calculateConfidence(
+                            gp.getStage(),
+                            score,
+                            seasonHistory,
+                            trackHistory,
+                            practice,
+                            qualifying,
+                            hasPenalty
+                    );
+
+            // ==========================================
+            // 8. RISK
+            // ==========================================
+
+            String risk =
+                    calculateRisk(
+                            gp,
+                            qualifying,
+                            hasPenalty,
+                            practice
+                    );
+
+            // ==========================================
+            // 9. ARGUMENTS
+            // ==========================================
+
+            String arguments =
+                    formArguments(
+                            seasonHistory,
+                            trackHistory,
+                            practice,
+                            qualifying,
+                            newsScore,
+                            hasPenalty
+                    );
+
+            Prediction prediction =
+                    Prediction.builder()
+                            .grandPrix(gp)
+                            .driver(driver)
+                            .stage(gp.getStage())
+                            .score(score)
+                            .confidence(confidence)
+                            .riskLevel(risk)
+                            .arguments(arguments)
+                            .build();
+
+            predictions.add(prediction);
         }
 
-        // 2. Сортируем пилотов по score (от большего к меньшему)
-        predictions.sort(Comparator.comparing(Prediction::getScore).reversed());
+        // ==========================================
+        // SORT
+        // ==========================================
 
-        // 3. Назначаем итоговые позиции (1-й, 2-й, 3-й...)
-        for (int i = 0; i < predictions.size(); i++) {
-            predictions.get(i).setPredictedPosition(i + 1);
+        predictions.sort(
+                Comparator.comparing(
+                        Prediction::getScore
+                ).reversed()
+        );
+
+        for (int i = 0;
+             i < predictions.size();
+             i++) {
+
+            predictions.get(i)
+                    .setPredictedPosition(i + 1);
         }
 
-        // 4. Сохраняем в БД и возвращаем на фронтенд
-        return predictionRepo.saveAll(predictions);
+        return predictionRepo.saveAll(
+                predictions
+        );
     }
 
-    // --- МЕТОДЫ РАСЧЕТА ---
+    // =========================================================
+    // SEASON HISTORY
+    // =========================================================
 
-    private double calculateScore(String stage, double overallHistScore, double trackHistScore, double newsScore, double paceScore, double gridScore, boolean hasPenalty) {
-        double score = 0.0;
+    private double calculateSeasonHistoryScore(
+            Long driverId,
+            int season
+    ) {
 
-        if ("UPCOMING".equals(stage)) {
-            score = (overallHistScore * 0.5) + (trackHistScore * 0.2) + (newsScore * 0.3);
-        } else if ("FP_DONE".equals(stage)) {
-            score = (overallHistScore * 0.3) + (trackHistScore * 0.1) + (newsScore * 0.2) + (paceScore * 0.4);
-        } else if ("QUALI_DONE".equals(stage)) {
-            score = (overallHistScore * 0.2) + (trackHistScore * 0.1) + (newsScore * 0.1) + (paceScore * 0.2) + (gridScore * 0.4);
+        Double averagePosition =
+                histRepo.findAveragePositionByDriverAndSeason(
+                        driverId,
+                        season
+                );
+
+        if (averagePosition == null) {
+            return 50.0;
         }
 
-        if (hasPenalty) score -= 15; // Штраф за риск из новостей
-        return Math.max(0, Math.min(100, score));
+        return positionToScore(
+                averagePosition
+        );
     }
 
-    /**
-     * Определяет уверенность в прогнозе зависимости от этапа и оценки
-     * @param stage - этап гран-при
-     * @param score - оценка пилота
-     * @return уверенность в прогнозе
-     */
-    private Double calculateConfidence(String stage, Double score) {
-        // Базовая уверенность зависит от стадии (чем больше данных, тем выше база)
-        double baseConfidence = 0.4;
-        if ("FP_DONE".equals(stage)) baseConfidence = 0.6;
-        if ("QUALI_DONE".equals(stage)) baseConfidence = 0.85;
+    // =========================================================
+    // TRACK HISTORY
+    // =========================================================
 
-        // НОВОЕ: Динамический бонус. Чем выше скор, тем больше уверенность.
-        // Например, при score=90 добавим +0.15, при score=50 добавим 0.
-        double scoreBonus = (score / 100.0) * 0.15;
+    private double calculateTrackHistoryScore(
+            Long driverId,
+            String gpName,
+            int currentSeason
+    ) {
 
-        double confidence = baseConfidence + scoreBonus;
+        Double averagePosition =
+                histRepo.findAverageTrackPosition(
+                        driverId,
+                        gpName,
+                        currentSeason
+                );
 
-        return Math.min(0.99, confidence);
+        if (averagePosition == null) {
+            return 50.0;
+        }
+
+        return positionToScore(
+                averagePosition
+        );
     }
 
-    private String calculateRisk(boolean hasPenalty, GrandPrix gp, double gridScore) {
-        // Если есть штрафы или авария в новостях — риск высокий
-        if (hasPenalty) return "HIGH";
+    private double positionToScore(
+            double averagePosition
+    ) {
 
-        // Если трасса узкая (как Монако) и пилот стартует далеко (gridScore < 50, т.е. хуже 10-го места)
-        if (gp.getName().toLowerCase().contains("monaco") && gridScore > 0 && gridScore < 50) {
+        return Math.max(
+                0,
+                Math.min(
+                        100,
+                        100 - ((averagePosition - 1) * 5)
+                )
+        );
+    }
+
+    // =========================================================
+    // NEWS
+    // =========================================================
+
+    private double calculateNewsScore(
+            List<News> driverNews
+    ) {
+
+        if (driverNews.isEmpty()) {
+            return 50.0;
+        }
+
+        double averageSentiment =
+                driverNews.stream()
+                        .mapToDouble(
+                                News::getSentimentScore
+                        )
+                        .average()
+                        .orElse(0.0);
+
+        return Math.max(
+                0,
+                Math.min(
+                        100,
+                        50 + averageSentiment * 50
+                )
+        );
+    }
+
+    // =========================================================
+    // PRACTICE
+    // =========================================================
+
+    private PracticeMetrics calculatePracticeMetrics(
+            GrandPrix gp,
+            Driver driver
+    ) {
+
+        PracticeResult result =
+                practiceRepo
+                        .findTopByGrandPrix_IdAndDriver_IdOrderByLapTimeMsAsc(
+                                gp.getId(),
+                                driver.getId()
+                        );
+
+        if (result == null) {
+            return PracticeMetrics.empty();
+        }
+
+        double positionScore =
+                positionToScore(
+                        result.getPosition()
+                );
+
+        double gapScore =
+                Math.max(
+                        0,
+                        100 - (
+                                result.getGapToP1Ms()
+                                        / 1000.0
+                                        * 10
+                        )
+                );
+
+        /*
+         * Место — 40%.
+         * Отставание от P1 — 60%.
+         */
+        double score =
+                positionScore * 0.4
+                        + gapScore * 0.6;
+
+        return new PracticeMetrics(
+                score,
+                result.getPosition(),
+                result.getGapToP1Ms()
+        );
+    }
+
+    // =========================================================
+    // QUALIFYING
+    // =========================================================
+
+    private QualifyingMetrics calculateQualifyingMetrics(
+            GrandPrix gp,
+            Driver driver
+    ) {
+
+        QualifyingResult result =
+                qualiRepo.findByGrandPrix_IdAndDriver_Id(
+                        gp.getId(),
+                        driver.getId()
+                );
+
+        if (result == null) {
+            return QualifyingMetrics.empty();
+        }
+
+        double qualifyingScore =
+                positionToScore(
+                        result.getPosition()
+                );
+
+        double gridScore = 0.0;
+
+        if (result.getStartingGrid() != null) {
+
+            gridScore =
+                    positionToScore(
+                            result.getStartingGrid()
+                    );
+        }
+
+        /*
+         * Квалификация 40%.
+         * Фактическая стартовая позиция 60%.
+         */
+        double score =
+                qualifyingScore * 0.4
+                        + gridScore * 0.6;
+
+        return new QualifyingMetrics(
+                score,
+                result.getPosition(),
+                result.getStartingGrid()
+        );
+    }
+
+    // =========================================================
+    // FINAL SCORE
+    // =========================================================
+
+    private double calculateScore(
+            String stage,
+            double seasonHistory,
+            double trackHistory,
+            double newsScore,
+            double practiceScore,
+            double qualifyingScore,
+            boolean hasPenalty
+    ) {
+
+        double score;
+
+        switch (stage) {
+
+            case "UPCOMING" -> {
+
+                score =
+                        seasonHistory * 0.50
+                                + trackHistory * 0.20
+                                + newsScore * 0.30;
+            }
+
+            case "FP_DONE" -> {
+
+                score =
+                        seasonHistory * 0.30
+                                + trackHistory * 0.10
+                                + newsScore * 0.20
+                                + practiceScore * 0.40;
+            }
+
+            case "QUALI_DONE" -> {
+
+                score =
+                        seasonHistory * 0.20
+                                + trackHistory * 0.10
+                                + newsScore * 0.10
+                                + practiceScore * 0.20
+                                + qualifyingScore * 0.40;
+            }
+
+            default -> score = 50.0;
+        }
+
+        if (hasPenalty) {
+            score -= 15;
+        }
+
+        return Math.max(
+                0,
+                Math.min(100, score)
+        );
+    }
+
+    // =========================================================
+    // CONFIDENCE
+    // =========================================================
+
+    private double calculateConfidence(
+            String stage,
+            double score,
+            double seasonHistory,
+            double trackHistory,
+            PracticeMetrics practice,
+            QualifyingMetrics qualifying,
+            boolean hasPenalty
+    ) {
+
+        double base;
+
+        switch (stage) {
+
+            case "UPCOMING" -> base = 0.40;
+            case "FP_DONE" -> base = 0.55;
+            case "QUALI_DONE" -> base = 0.70;
+            default -> base = 0.30;
+        }
+
+        /*
+         * Чем выше качество самого score,
+         * тем больше уверенность.
+         */
+        double scoreComponent =
+                Math.abs(score - 50) / 50.0 * 0.15;
+
+        /*
+         * Наличие реальных данных.
+         */
+        double dataBonus = 0.0;
+
+        if (seasonHistory != 50.0) {
+            dataBonus += 0.05;
+        }
+
+        if (trackHistory != 50.0) {
+            dataBonus += 0.03;
+        }
+
+        if (practice.available()) {
+            dataBonus += 0.05;
+        }
+
+        if (qualifying.available()) {
+            dataBonus += 0.07;
+        }
+
+        /*
+         * Если данные противоречат друг другу,
+         * уверенность снижаем.
+         */
+        double disagreement =
+                calculateDisagreement(
+                        seasonHistory,
+                        trackHistory,
+                        practice,
+                        qualifying
+                );
+
+        double confidence =
+                base
+                        + scoreComponent
+                        + dataBonus
+                        - disagreement;
+
+        if (hasPenalty) {
+            confidence -= 0.05;
+        }
+
+        return Math.max(
+                0.10,
+                Math.min(
+                        0.99,
+                        confidence
+                )
+        );
+    }
+
+    private double calculateDisagreement(
+            double seasonHistory,
+            double trackHistory,
+            PracticeMetrics practice,
+            QualifyingMetrics qualifying
+    ) {
+
+        List<Double> scores =
+                new ArrayList<>();
+
+        scores.add(seasonHistory);
+        scores.add(trackHistory);
+
+        if (practice.available()) {
+            scores.add(practice.score());
+        }
+
+        if (qualifying.available()) {
+            scores.add(qualifying.score());
+        }
+
+        if (scores.size() < 2) {
+            return 0.0;
+        }
+
+        double average =
+                scores.stream()
+                        .mapToDouble(Double::doubleValue)
+                        .average()
+                        .orElse(50);
+
+        double variance =
+                scores.stream()
+                        .mapToDouble(
+                                value ->
+                                        Math.pow(
+                                                value - average,
+                                                2
+                                        )
+                        )
+                        .average()
+                        .orElse(0);
+
+        double standardDeviation =
+                Math.sqrt(variance);
+
+        return Math.min(
+                0.15,
+                standardDeviation / 100.0
+        );
+    }
+
+    // =========================================================
+    // RISK
+    // =========================================================
+
+    private String calculateRisk(
+            GrandPrix gp,
+            QualifyingMetrics qualifying,
+            boolean hasPenalty,
+            PracticeMetrics practice
+    ) {
+
+        if (hasPenalty) {
             return "HIGH";
         }
 
-        // Если стадия ранняя, данных мало — риск средний
-        if ("UPCOMING".equals(gp.getStage())) return "MEDIUM";
+        if (qualifying.available()
+                && qualifying.startingGrid() != null
+                && qualifying.startingGrid() > 15) {
+
+            return "HIGH";
+        }
+
+        if (practice.available()
+                && practice.position() > 15) {
+
+            return "HIGH";
+        }
+
+        if ("UPCOMING".equals(gp.getStage())) {
+            return "MEDIUM";
+        }
 
         return "LOW";
     }
 
-    private String formArguments(double overallHistScore, double trackHistScore, double newsScore, boolean hasPenalty) {
-        String newsExplanation;
-        if (newsScore == 50.0 && !hasPenalty) {
-            newsExplanation = "Релевантных новостей не найдено. Использован нейтральный коэффициент (50/100).";
-        } else {
-            newsExplanation = String.format("Влияние новостей: %.1f/100. Наличие рисков: %b", newsScore, hasPenalty);
-        }
+    // =========================================================
+    // ARGUMENTS
+    // =========================================================
 
-        return String.format(
-                "{\"overallHistory\": \"%.1f/100\", " +
-                        "\"trackHistory\": \"%.1f/100\", " +
-                        "\"news\": \"%s\"}",
-                overallHistScore, trackHistScore, newsExplanation
+    private String formArguments(
+            double seasonHistory,
+            double trackHistory,
+            PracticeMetrics practice,
+            QualifyingMetrics qualifying,
+            double newsScore,
+            boolean hasPenalty
+    ) {
+
+        ObjectNode json =
+                new ObjectMapper().createObjectNode();
+
+        json.put(
+                "seasonHistory",
+                round(seasonHistory)
         );
-    }
 
-    private double calculateOverallHistoryScore(Long driverId, String teamName) {
-        List<HistoricalResult> results = histRepo.findByDriver_Id(driverId);
+        json.put(
+                "trackHistory",
+                round(trackHistory)
+        );
 
-        if (results.isEmpty()) {
-            results = histRepo.findByTeamName(teamName);
+        json.put(
+                "news",
+                round(newsScore)
+        );
+
+        json.put(
+                "penalty",
+                hasPenalty
+        );
+
+        if (practice.available()) {
+
+            json.put(
+                    "practiceScore",
+                    round(practice.score())
+            );
+
+            json.put(
+                    "practicePosition",
+                    practice.position()
+            );
+
+            json.put(
+                    "practiceGapToP1Ms",
+                    practice.gapToP1Ms()
+            );
         }
 
-        if (results.isEmpty()) return 50.0;
+        if (qualifying.available()) {
 
-        double avgPos = results.stream()
-                .mapToInt(HistoricalResult::getFinalPosition)
-                .average().orElse(10.0);
+            json.put(
+                    "qualifyingScore",
+                    round(qualifying.score())
+            );
 
-        return Math.max(0, 100 - ((avgPos - 1) * 5));
+            json.put(
+                    "qualifyingPosition",
+                    qualifying.qualifyingPosition()
+            );
+
+            json.put(
+                    "startingGrid",
+                    qualifying.startingGrid()
+            );
+        }
+
+        return json.toString();
     }
 
-    private double calculateTrackHistoryScore(Long driverId, String gpName) {
-        List<HistoricalResult> results = histRepo.findByDriver_IdAndGpName(driverId, gpName);
-        if (results.isEmpty()) return 50.0;
+    private double round(double value) {
+        return Math.round(value * 10.0) / 10.0;
+    }
 
-        double avgPos = results.stream()
-                .mapToInt(HistoricalResult::getFinalPosition)
-                .average().orElse(10.0);
+    // =========================================================
+    // RECORDS
+    // =========================================================
 
-        return Math.max(0, 100 - ((avgPos - 1) * 5));
+    private record PracticeMetrics(
+            double score,
+            Integer position,
+            Integer gapToP1Ms
+    ) {
+
+        static PracticeMetrics empty() {
+            return new PracticeMetrics(
+                    50.0,
+                    null,
+                    null
+            );
+        }
+
+        boolean available() {
+            return position != null;
+        }
+    }
+
+    private record QualifyingMetrics(
+            double score,
+            Integer qualifyingPosition,
+            Integer startingGrid
+    ) {
+
+        static QualifyingMetrics empty() {
+            return new QualifyingMetrics(
+                    50.0,
+                    null,
+                    null
+            );
+        }
+
+        boolean available() {
+            return qualifyingPosition != null;
+        }
     }
 }

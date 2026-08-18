@@ -106,7 +106,6 @@ databaseChangeLog:
               - column:
                   name: raw_xml
                   type: text
-        # Индекс для быстрого поиска дубликатов новостей по URL
         - createIndex:
             indexName: idx_news_url
             tableName: news
@@ -146,6 +145,9 @@ databaseChangeLog:
               - column:
                   name: team_name
                   type: varchar(100)
+              - column:
+                  name: session_key
+                  type: int
         - createIndex:
             indexName: idx_hist_driver_gp
             tableName: historical_results
@@ -154,6 +156,10 @@ databaseChangeLog:
                   name: driver_id
               - column:
                   name: gp_name
+        - addUniqueConstraint:
+            constraintName: uk_historical_driver_gp_season
+            tableName: historical_results
+            columnNames: driver_id, gp_name, season
 
   # 5. Таблица результатов практик
   - changeSet:
@@ -185,11 +191,18 @@ databaseChangeLog:
                   name: session_type
                   type: varchar(10)
               - column:
+                  name: position
+                  type: int
+              - column:
                   name: lap_time_ms
                   type: int
               - column:
                   name: gap_to_p1_ms
                   type: int
+        - addUniqueConstraint:
+            constraintName: uk_practice_gp_driver_session
+            tableName: practice_results
+            columnNames: gp_id, driver_id, session_type
 
   # 6. Таблица результатов квалификации
   - changeSet:
@@ -221,8 +234,15 @@ databaseChangeLog:
                   name: position
                   type: int
               - column:
+                  name: starting_grid
+                  type: int
+              - column:
                   name: q3_time_ms
                   type: int
+        - addUniqueConstraint:
+            constraintName: uk_qualifying_gp_driver
+            tableName: qualifying_results
+            columnNames: gp_id, driver_id
 
   # 7. Таблица прогнозов
   - changeSet:
@@ -302,3 +322,13 @@ databaseChangeLog:
               - column:
                   name: error_margin
                   type: int
+              - column:
+                  name: error_type
+                  type: varchar(30)
+              - column:
+                  name: error_explanation
+                  type: text
+        - addUniqueConstraint:
+            constraintName: uk_actual_gp_driver
+            tableName: actual_results
+            columnNames: gp_id, driver_id

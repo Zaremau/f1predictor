@@ -8,7 +8,6 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -20,105 +19,180 @@ public class GrandPrixFacadeService {
     private final OpenF1Service openF1Service;
     private final PredictionService predictionService;
 
-    /**
-     * Возвращает список всех Гран-при для главной страницы фронтенда
-     */
     public List<GrandPrix> getAllGrandPrix() {
         return gpRepo.findAll();
     }
 
-    /**
-     * Решает, что отдать на фронтенд (прогноз или результаты)
-     */
     public List<?> getGrandPrixData(Long gpId) {
-        GrandPrix gp = gpRepo.findById(gpId).orElseThrow();
 
-        // --- 1. Если гонка уже прошла ---
+        GrandPrix gp =
+                gpRepo.findById(gpId)
+                        .orElseThrow();
+
+        // ==========================================
+        // RACE ALREADY FINISHED
+        // ==========================================
+
         if ("RACE_DONE".equals(gp.getStage())) {
             return getRaceResults(gpId);
         }
-        // Паузы из-за лимита OpenF1 API
-        try { Thread.sleep(400); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        // --- 2. Если гонка еще не прошла ---
-        // Сначала синхронизируем статус (вдруг прошла квалификация)
-        openF1Service.syncGrandPrixData(gpId);
-        GrandPrix updatedGp = gpRepo.findById(gpId).orElseThrow();
 
-        // Проверяем, не изменился ли статус на RACE_DONE после синхронизации
+        // ==========================================
+        // UPDATE CURRENT GP
+        // ==========================================
+
+        openF1Service.syncGrandPrixData(gpId);
+
+        GrandPrix updatedGp =
+                gpRepo.findById(gpId)
+                        .orElseThrow();
+
         if ("RACE_DONE".equals(updatedGp.getStage())) {
             return getRaceResults(gpId);
         }
 
-        // Проверяем, есть ли уже сохраненный прогноз
-        List<Prediction> existingPredictions = predictionRepo.findByGrandPrix_Id(gpId);
+        // ==========================================
+        // EXISTING PREDICTION
+        // ==========================================
 
-        // Если прогноза нет, ИЛИ стадия изменилась (например, была UPCOMING, стала QUALI_DONE) - генерируем заново
-        if (existingPredictions.isEmpty() || !existingPredictions.get(0).getStage().equals(updatedGp.getStage())) {
-            if (!existingPredictions.isEmpty()) {
-                predictionRepo.deleteAll(existingPredictions); // Удаляем устаревший прогноз
+        List<Prediction> predictions =
+                predictionRepo.findByGrandPrix_Id(gpId);
+
+        boolean needNewPrediction =
+                predictions.isEmpty()
+                        || !predictions.get(0)
+                        .getStage()
+                        .equals(updatedGp.getStage());
+
+        if (needNewPrediction) {
+
+            if (!predictions.isEmpty()) {
+                predictionRepo.deleteAll(predictions);
             }
-            openF1Service.fetchHistoryForGrandPrix(updatedGp);
-            existingPredictions = predictionService.generatePredictions(gpId); // Считаем заново
+
+            /*
+             * Получаем:
+             *
+             * - результаты гонок 2026;
+             * - последние результаты этой трассы.
+             */
+            openF1Service.syncHistoricalData(
+                    updatedGp
+            );
+
+            predictions =
+                    predictionService
+                            .generatePredictions(gpId);
         }
 
-        // Конвертируем сущности в DTO и отдаем
-        return existingPredictions.stream()
+        return predictions.stream()
                 .map(this::convertToPredictionDto)
-                .collect(Collectors.toList());
+                .toList();
     }
 
-    /**
-     * Вспомогательный метод: собирает результаты прошедшей гонки
-     */
-    private List<ActualResultDto> getRaceResults(Long gpId) {
-        // Пробуем достать результаты из БД
-        List<ActualResult> results = actualResultRepo.findByGrandPrix_IdOrderByFinalPositionAsc(gpId);
+    private List<ActualResultDto> getRaceResults(
+            Long gpId
+    ) {
 
-        // Если их там еще нет (гонка только что закончилась), скачиваем из OpenF1
+        List<ActualResult> results =
+                actualResultRepo
+                        .findByGrandPrix_IdOrderByFinalPositionAsc(
+                                gpId
+                        );
+
         if (results.isEmpty()) {
-            openF1Service.fetchAndSaveRaceResults(gpId);
-            results = actualResultRepo.findByGrandPrix_IdOrderByFinalPositionAsc(gpId);
+
+            openF1Service.fetchAndSaveRaceResults(
+                    gpId
+            );
+
+            results =
+                    actualResultRepo
+                            .findByGrandPrix_IdOrderByFinalPositionAsc(
+                                    gpId
+                            );
         }
 
-        // Формируем DTO для фронтенда
-        return results.stream().map(res -> {
-            // Ищем, был ли построен прогноз для этого пилота ДО гонки
-            Prediction pred = predictionRepo.findByGrandPrix_IdAndDriver_Id(gpId, res.getDriver().getId());
-            Integer predictedPos = (pred != null) ? pred.getPredictedPosition() : null;
+        return results.stream()
+                .map(res -> {
 
-            // Формируем текстовое объяснение ошибки (Explainable AI)
-            String explanation;
-            if (predictedPos == null) {
-                explanation = "Прогноз на эту гонку не строился.";
-            } else if (res.getErrorMargin() == 0) {
-                explanation = "Прогноз идеален!";
-            } else {
-                explanation = "Система ошиблась на " + res.getErrorMargin() + " позиций.";
-            }
+                    Prediction prediction =
+                            predictionRepo
+                                    .findByGrandPrix_IdAndDriver_Id(
+                                            gpId,
+                                            res.getDriver().getId()
+                                    );
 
-            return ActualResultDto.builder()
-                    .driverName(res.getDriver().getName())
-                    .team(res.getDriver().getTeam())
-                    .predictedPosition(predictedPos) // Будет null, если прогноза не было
-                    .actualPosition(res.getFinalPosition())
-                    .errorMargin(res.getErrorMargin())
-                    .explanation(explanation)
-                    .build();
-        }).collect(Collectors.toList());
+                    Integer predictedPosition =
+                            prediction == null
+                                    ? null
+                                    : prediction.getPredictedPosition();
+
+                    String explanation;
+
+                    if (prediction == null) {
+
+                        explanation =
+                                "Прогноз на эту гонку " +
+                                        "не строился.";
+
+                    } else {
+
+                        explanation =
+                                res.getErrorExplanation();
+                    }
+
+                    return ActualResultDto.builder()
+                            .driverName(
+                                    res.getDriver().getName()
+                            )
+                            .team(
+                                    res.getDriver().getTeam()
+                            )
+                            .predictedPosition(
+                                    predictedPosition
+                            )
+                            .actualPosition(
+                                    res.getFinalPosition()
+                            )
+                            .errorMargin(
+                                    res.getErrorMargin()
+                            )
+                            .explanation(
+                                    explanation
+                            )
+                            .build();
+
+                })
+                .toList();
     }
 
-    /**
-     * Вспомогательный метод: маппинг Prediction в PredictionDto
-     */
-    private PredictionDto convertToPredictionDto(Prediction pred) {
+    private PredictionDto convertToPredictionDto(
+            Prediction pred
+    ) {
+
         return PredictionDto.builder()
-                .driverName(pred.getDriver().getName())
-                .team(pred.getDriver().getTeam())
-                .predictedPosition(pred.getPredictedPosition())
-                .confidence(pred.getConfidence())
-                .riskLevel(pred.getRiskLevel())
-                .arguments(pred.getArguments())
-                .stage(pred.getStage())
+                .driverName(
+                        pred.getDriver().getName()
+                )
+                .team(
+                        pred.getDriver().getTeam()
+                )
+                .predictedPosition(
+                        pred.getPredictedPosition()
+                )
+                .confidence(
+                        pred.getConfidence()
+                )
+                .riskLevel(
+                        pred.getRiskLevel()
+                )
+                .arguments(
+                        pred.getArguments()
+                )
+                .stage(
+                        pred.getStage()
+                )
                 .build();
     }
 }

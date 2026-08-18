@@ -3,9 +3,15 @@ package com.cashfactories.formula_one_future_oracle.repository;
 import com.cashfactories.formula_one_future_oracle.model.QualifyingResult;
 import org.springframework.data.jpa.repository.JpaRepository;
 
-public interface QualifyingRepository extends JpaRepository<QualifyingResult, Long> {
+import java.util.List;
 
-    QualifyingResult findByGrandPrix_IdAndDriver_Id(Long gpId, Long driverId);
+public interface QualifyingRepository
+        extends JpaRepository<QualifyingResult, Long> {
 
-    CharSequence findByGrandPrix_Id(Long grnadPrixId);
+    QualifyingResult findByGrandPrix_IdAndDriver_Id(
+            Long gpId,
+            Long driverId
+    );
+
+    List<QualifyingResult> findByGrandPrix_Id(Long grandPrixId);
 }

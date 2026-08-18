@@ -4,9 +4,17 @@ import jakarta.persistence.*;
 import lombok.*;
 
 @Entity
-@Table(name = "qualifying_results")
-@Getter @Setter
-@NoArgsConstructor @AllArgsConstructor
+@Table(
+        name = "qualifying_results",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_qualifying_gp_driver",
+                columnNames = {"gp_id", "driver_id"}
+        )
+)
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
 @Builder
 public class QualifyingResult {
 
@@ -15,15 +23,18 @@ public class QualifyingResult {
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "gp_id")
+    @JoinColumn(name = "gp_id", nullable = false)
     private GrandPrix grandPrix;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "driver_id")
+    @JoinColumn(name = "driver_id", nullable = false)
     private Driver driver;
 
     @Column(name = "position")
     private Integer position;
+
+    @Column(name = "starting_grid")
+    private Integer startingGrid;
 
     @Column(name = "q3_time_ms")
     private Integer q3TimeMs;

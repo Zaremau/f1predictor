@@ -5,9 +5,17 @@ import jakarta.persistence.*;
 import lombok.*;
 
 @Entity
-@Table(name = "practice_results")
-@Getter @Setter
-@NoArgsConstructor @AllArgsConstructor
+@Table(
+        name = "practice_results",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_practice_gp_driver_session",
+                columnNames = {"gp_id", "driver_id", "session_type"}
+        )
+)
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
 @Builder
 public class PracticeResult {
 
@@ -16,15 +24,18 @@ public class PracticeResult {
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "gp_id")
+    @JoinColumn(name = "gp_id", nullable = false)
     private GrandPrix grandPrix;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "driver_id")
+    @JoinColumn(name = "driver_id", nullable = false)
     private Driver driver;
 
     @Column(name = "session_type", length = 10)
-    private String sessionType; // FP1, FP2, FP3
+    private String sessionType;
+
+    @Column(name = "position")
+    private Integer position;
 
     @Column(name = "lap_time_ms")
     private Integer lapTimeMs;

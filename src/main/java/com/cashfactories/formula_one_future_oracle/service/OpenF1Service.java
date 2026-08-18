@@ -10,7 +10,9 @@ import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.util.UriUtils;
 
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.*;
@@ -20,8 +22,8 @@ import java.util.*;
 @Slf4j
 public class OpenF1Service {
 
-    private final RestTemplate restTemplate = new RestTemplate(getClientHttpRequestFactory());
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private static final String BASE_URL =
+            "https://api.openf1.org/v1";
 
     private final GrandPrixRepository gpRepo;
     private final DriverRepository driverRepo;
@@ -31,308 +33,792 @@ public class OpenF1Service {
     private final PredictionRepository predictionRepo;
     private final HistoricalResultRepository histRepo;
 
-    // Настройка таймаутов
+    private final RestTemplate restTemplate =
+            new RestTemplate(getClientHttpRequestFactory());
+
+    private final ObjectMapper objectMapper =
+            new ObjectMapper();
+
     private SimpleClientHttpRequestFactory getClientHttpRequestFactory() {
-        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(3000);
-        factory.setReadTimeout(3000);
+
+        SimpleClientHttpRequestFactory factory =
+                new SimpleClientHttpRequestFactory();
+
+        factory.setConnectTimeout(5000);
+        factory.setReadTimeout(10000);
+
         return factory;
     }
 
-    private static final String BASE_URL = "https://api.openf1.org/v1";
+    // =========================================================
+    // GRAND PRIX STATUS
+    // =========================================================
 
-    /**
-     * Синхронизирует статус Гран-при и подтягивает данные из OpenF1 перед прогнозом
-     */
     @Transactional
     public GrandPrix syncGrandPrixData(Long gpId) {
-        GrandPrix gp = gpRepo.findById(gpId).orElseThrow();
 
-        // Если гонка уже прошла, синхронизировать не нужно
+        GrandPrix gp = gpRepo.findById(gpId)
+                .orElseThrow();
+
         if ("RACE_DONE".equals(gp.getStage())) {
             return gp;
         }
 
         try {
+
             int year = gp.getRaceDate().getYear();
             String country = gp.getCountry();
+
             LocalDateTime now = LocalDateTime.now();
 
-            // 1. Проверяем Квалификацию
-            String qualiUrl = BASE_URL + "/sessions?year=" + year + "&country_name=" + country + "&session_name=Qualifying";
-            JsonNode qualiSessions = restTemplate.getForObject(qualiUrl, JsonNode.class);
+            // -------------------------
+            // QUALIFYING
+            // -------------------------
 
-            if (qualiSessions != null && qualiSessions.size() > 0) {
-                JsonNode qualiSession = qualiSessions.get(0);
-                LocalDateTime qualiDate = OffsetDateTime.parse(qualiSession.get("date_end").asText()).toLocalDateTime();
+            JsonNode qualifyingSessions =
+                    getSessions(year, country, "Qualifying");
 
-                // Если квалификация уже закончилась
-                if (qualiDate.isBefore(now)) {
-                    int sessionKey = qualiSession.get("session_key").asInt();
-                    fetchAndSaveQualifying(gp, sessionKey);
+            if (!qualifyingSessions.isEmpty()) {
+
+                JsonNode session = qualifyingSessions.get(0);
+
+                LocalDateTime dateEnd =
+                        OffsetDateTime.parse(
+                                session.get("date_end").asText()
+                        ).toLocalDateTime();
+
+                if (dateEnd.isBefore(now)) {
+
+                    int sessionKey =
+                            session.get("session_key").asInt();
+
+                    fetchAndSaveQualifying(
+                            gp,
+                            sessionKey
+                    );
+
                     gp.setStage("QUALI_DONE");
                     gpRepo.save(gp);
-                    log.info("Статус GP {} обновлен до QUALI_DONE", gpId);
+
+                    log.info(
+                            "GP {} updated to QUALI_DONE",
+                            gpId
+                    );
+
                     return gp;
                 }
             }
 
-            // 2. Если квалификации еще нет, проверяем Practice 3
-            String practiceUrl = BASE_URL + "/sessions?year=" + year + "&country_name=" + country + "&session_name=Practice 3";
-            JsonNode practiceSessions = restTemplate.getForObject(practiceUrl, JsonNode.class);
+            // -------------------------
+            // FP3
+            // -------------------------
 
-            if (practiceSessions != null && !practiceSessions.isEmpty()) {
-                JsonNode practiceSession = practiceSessions.get(0);
-                LocalDateTime practiceDate = OffsetDateTime.parse(practiceSession.get("date_end").asText()).toLocalDateTime();
+            JsonNode practiceSessions =
+                    getSessions(year, country, "Practice 3");
 
-                if (practiceDate.isBefore(now)) {
-                    int sessionKey = practiceSession.get("session_key").asInt();
-                    fetchAndSavePractice(gp, sessionKey);
+            if (!practiceSessions.isEmpty()) {
+
+                JsonNode session =
+                        practiceSessions.get(0);
+
+                LocalDateTime dateEnd =
+                        OffsetDateTime.parse(
+                                session.get("date_end").asText()
+                        ).toLocalDateTime();
+
+                if (dateEnd.isBefore(now)) {
+
+                    int sessionKey =
+                            session.get("session_key").asInt();
+
+                    fetchAndSavePractice(
+                            gp,
+                            sessionKey
+                    );
+
                     gp.setStage("FP_DONE");
                     gpRepo.save(gp);
-                    log.info("Статус GP {} обновлен до FP_DONE", gpId);
+
+                    log.info(
+                            "GP {} updated to FP_DONE",
+                            gpId
+                    );
+
                     return gp;
                 }
             }
+
         } catch (Exception e) {
-            log.error("Ошибка при синхронизации с OpenF1: {}", e.getMessage());
+
+            log.error(
+                    "OpenF1 sync failed for GP {}",
+                    gpId,
+                    e
+            );
         }
 
-        return gp; // Возвращаем GP с текущим (UPCOMING) статусом
+        return gp;
     }
 
-    /**
-     * Сохраняет результаты квалификации
-     */
-    private void fetchAndSaveQualifying(GrandPrix gp, int sessionKey) throws Exception {
-        // Если уже сохраняли, не дублируем
-        if (qualiRepo.count() > 0 && !qualiRepo.findByGrandPrix_Id(gp.getId()).isEmpty()) return;
+    private JsonNode getSessions(
+            int year,
+            String country,
+            String sessionName
+    ) {
 
-        String posJson = restTemplate.getForObject(BASE_URL + "/position?session_key=" + sessionKey, String.class);
-        JsonNode positions = objectMapper.readTree(posJson);
+        String url =
+                BASE_URL
+                        + "/sessions?year="
+                        + year
+                        + "&country_name="
+                        + UriUtils.encodeQueryParam(
+                        country,
+                        StandardCharsets.UTF_8
+                )
+                        + "&session_name="
+                        + UriUtils.encodeQueryParam(
+                        sessionName,
+                        StandardCharsets.UTF_8
+                );
 
-        Map<Integer, Integer> finalPositions = getFinalPositions(positions);
+        return restTemplate.getForObject(
+                url,
+                JsonNode.class
+        );
+    }
 
-        for (Map.Entry<Integer, Integer> entry : finalPositions.entrySet()) {
-            driverRepo.findByDriverNumber(entry.getKey()).ifPresent(driver -> {
-                qualiRepo.save(QualifyingResult.builder()
-                        .grandPrix(gp)
-                        .driver(driver)
-                        .position(entry.getValue())
-                        .build());
-            });
+    // =========================================================
+    // PRACTICE
+    // =========================================================
+
+    private void fetchAndSavePractice(
+            GrandPrix gp,
+            int sessionKey
+    ) {
+
+        List<PracticeResult> existing =
+                practiceRepo.findByGrandPrix_Id(gp.getId());
+
+        if (!existing.isEmpty()) {
+            return;
+        }
+
+        String url =
+                BASE_URL
+                        + "/session_result?session_key="
+                        + sessionKey;
+
+        JsonNode results =
+                restTemplate.getForObject(
+                        url,
+                        JsonNode.class
+                );
+
+        if (results == null || results.isEmpty()) {
+            return;
+        }
+
+        for (JsonNode result : results) {
+
+            int driverNumber =
+                    result.path("driver_number").asInt();
+
+            int position =
+                    result.path("position").asInt();
+
+            double duration =
+                    result.path("duration").asDouble();
+
+            double gap =
+                    parseGap(
+                            result.path("gap_to_leader")
+                    );
+
+            driverRepo.findByDriverNumber(driverNumber)
+                    .ifPresent(driver -> {
+
+                        PracticeResult practice =
+                                PracticeResult.builder()
+                                        .grandPrix(gp)
+                                        .driver(driver)
+                                        .sessionType("FP3")
+                                        .position(position)
+                                        .lapTimeMs(
+                                                (int) (duration * 1000)
+                                        )
+                                        .gapToP1Ms(
+                                                (int) (gap * 1000)
+                                        )
+                                        .build();
+
+                        practiceRepo.save(practice);
+                    });
         }
     }
 
-    /**
-     * Сохраняет лучшее время круга из практики
-     */
-    private void fetchAndSavePractice(GrandPrix gp, int sessionKey) throws Exception {
-        if (practiceRepo.count() > 0 && !practiceRepo.findByGrandPrix_Id(gp.getId()).isEmpty()) return;
+    // =========================================================
+    // QUALIFYING
+    // =========================================================
 
-        String lapsJson = restTemplate.getForObject(BASE_URL + "/lap?session_key=" + sessionKey, String.class);
-        JsonNode laps = objectMapper.readTree(lapsJson);
+    private void fetchAndSaveQualifying(
+            GrandPrix gp,
+            int sessionKey
+    ) {
 
-        // Собираем лучшие круги каждого пилота
-        Map<Integer, Double> bestLaps = new HashMap<>();
-        for (JsonNode lap : laps) {
-            int drvNum = lap.get("driver_number").asInt();
-            double lapDuration = lap.get("lap_duration").asDouble(); // в секундах
-            if (!bestLaps.containsKey(drvNum) || lapDuration < bestLaps.get(drvNum)) {
-                bestLaps.put(drvNum, lapDuration);
+        if (!qualiRepo.findByGrandPrix_Id(gp.getId())
+                .isEmpty()) {
+            return;
+        }
+
+        String resultUrl =
+                BASE_URL
+                        + "/session_result?session_key="
+                        + sessionKey;
+
+        String gridUrl =
+                BASE_URL
+                        + "/starting_grid?session_key="
+                        + getRaceSessionKey(gp);
+
+        JsonNode qualifyingResults =
+                restTemplate.getForObject(
+                        resultUrl,
+                        JsonNode.class
+                );
+
+        JsonNode startingGrid =
+                restTemplate.getForObject(
+                        gridUrl,
+                        JsonNode.class
+                );
+
+        Map<Integer, Integer> gridPositions =
+                new HashMap<>();
+
+        if (startingGrid != null) {
+
+            for (JsonNode node : startingGrid) {
+
+                gridPositions.put(
+                        node.path("driver_number").asInt(),
+                        node.path("position").asInt()
+                );
             }
         }
 
-        // Находим время лидера (P1)
-        double p1Time = bestLaps.values().stream().min(Double::compare).orElse(0.0);
+        if (qualifyingResults == null) {
+            return;
+        }
 
-        // Сохраняем в БД
-        for (Map.Entry<Integer, Double> entry : bestLaps.entrySet()) {
-            driverRepo.findByDriverNumber(entry.getKey()).ifPresent(driver -> {
-                int lapTimeMs = (int) (entry.getValue() * 1000);
-                int gapToP1Ms = (int) ((entry.getValue() - p1Time) * 1000);
+        for (JsonNode result : qualifyingResults) {
 
-                practiceRepo.save(PracticeResult.builder()
-                        .grandPrix(gp)
-                        .driver(driver)
-                        .sessionType("FP3")
-                        .lapTimeMs(lapTimeMs)
-                        .gapToP1Ms(gapToP1Ms)
-                        .build());
-            });
+            int driverNumber =
+                    result.path("driver_number").asInt();
+
+            int qualifyingPosition =
+                    result.path("position").asInt();
+
+            Integer staGrid =
+                    gridPositions.get(driverNumber);
+
+            Integer q3TimeMs =
+                    extractQ3TimeMs(result);
+
+            driverRepo.findByDriverNumber(driverNumber)
+                    .ifPresent(driver -> {
+
+                        QualifyingResult qualifying =
+                                QualifyingResult.builder()
+                                        .grandPrix(gp)
+                                        .driver(driver)
+                                        .position(
+                                                qualifyingPosition
+                                        )
+                                        .startingGrid(
+                                                staGrid
+                                        )
+                                        .q3TimeMs(q3TimeMs)
+                                        .build();
+
+                        qualiRepo.save(qualifying);
+                    });
         }
     }
 
-    /**
-     * Получает финальные результаты гонки и считает ошибку прогноза
-     */
+    private Integer extractQ3TimeMs(
+            JsonNode result
+    ) {
+
+        JsonNode duration =
+                result.path("duration");
+
+        if (!duration.isArray()
+                || duration.size() < 3) {
+            return null;
+        }
+
+        JsonNode q3 =
+                duration.get(2);
+
+        if (!q3.isNumber()) {
+            return null;
+        }
+
+        return (int) (q3.asDouble() * 1000);
+    }
+
+    // =========================================================
+    // CURRENT SEASON + TRACK HISTORY
+    // =========================================================
+
     @Transactional
-    public void fetchAndSaveRaceResults(Long gpId) {
-        GrandPrix gp = gpRepo.findById(gpId).orElseThrow();
-        if ("RACE_DONE".equals(gp.getStage())) return;
+    public void syncHistoricalData(
+            GrandPrix targetGp
+    ) {
+
+        int currentYear =
+                targetGp.getRaceDate().getYear();
+
+        /*
+         * 1. Все уже завершенные гонки текущего сезона.
+         *
+         * Они нужны для seasonHistory.
+         */
+        syncCurrentSeasonHistory(currentYear);
+
+        /*
+         * 2. Последние три проведения этой трассы.
+         *
+         * Они нужны для trackHistory.
+         */
+        for (int year = currentYear - 1;
+             year >= currentYear - 3;
+             year--) {
+
+            syncTrackHistory(
+                    targetGp,
+                    year
+            );
+        }
+    }
+
+    private void syncCurrentSeasonHistory(
+            int season
+    ) {
+
+        String url =
+                BASE_URL
+                        + "/sessions?year="
+                        + season
+                        + "&session_name=Race";
+
+        JsonNode sessions =
+                restTemplate.getForObject(
+                        url,
+                        JsonNode.class
+                );
+
+        if (sessions == null) {
+            return;
+        }
+
+        LocalDateTime now =
+                LocalDateTime.now();
+
+        for (JsonNode session : sessions) {
+
+            String dateEndText =
+                    session.path("date_end").asText();
+
+            if (dateEndText.isBlank()) {
+                continue;
+            }
+
+            LocalDateTime dateEnd =
+                    OffsetDateTime.parse(dateEndText)
+                            .toLocalDateTime();
+
+            // Только уже завершившиеся гонки
+            if (dateEnd.isAfter(now)) {
+                continue;
+            }
+
+            int sessionKey =
+                    session.path("session_key").asInt();
+
+            String gpName =
+                    session.path("location").asText();
+
+            saveRaceHistoryIfNeeded(
+                    gpName,
+                    season,
+                    sessionKey
+            );
+        }
+    }
+
+    private void syncTrackHistory(
+            GrandPrix targetGp,
+            int season
+    ) {
+
+        String url =
+                BASE_URL
+                        + "/sessions?year="
+                        + season
+                        + "&country_name="
+                        + UriUtils.encodeQueryParam(
+                        targetGp.getCountry(),
+                        StandardCharsets.UTF_8
+                )
+                        + "&session_name=Race";
+
+        JsonNode sessions =
+                restTemplate.getForObject(
+                        url,
+                        JsonNode.class
+                );
+
+        if (sessions == null) {
+            return;
+        }
+
+        for (JsonNode session : sessions) {
+
+            int sessionKey =
+                    session.path("session_key").asInt();
+
+            String gpName =
+                    targetGp.getName();
+
+            if (!histRepo.existsByGpNameAndSeason(
+                    gpName,
+                    season
+            )) {
+
+                saveRaceHistory(
+                        gpName,
+                        season,
+                        sessionKey
+                );
+            }
+        }
+    }
+
+    private void saveRaceHistoryIfNeeded(
+            String gpName,
+            int season,
+            int sessionKey
+    ) {
+
+        if (histRepo.existsByGpNameAndSeason(
+                gpName,
+                season
+        )) {
+            return;
+        }
+
+        saveRaceHistory(
+                gpName,
+                season,
+                sessionKey
+        );
+    }
+
+    private void saveRaceHistory(
+            String gpName,
+            int season,
+            int sessionKey
+    ) {
+
+        String url =
+                BASE_URL
+                        + "/session_result?session_key="
+                        + sessionKey;
+
+        JsonNode results =
+                restTemplate.getForObject(
+                        url,
+                        JsonNode.class
+                );
+
+        if (results == null) {
+            return;
+        }
+
+        for (JsonNode result : results) {
+
+            boolean dnf =
+                    result.path("dnf").asBoolean(false);
+
+            boolean dns =
+                    result.path("dns").asBoolean(false);
+
+            boolean dsq =
+                    result.path("dsq").asBoolean(false);
+
+            /*
+             * Для средней позиции учитываем
+             * только нормальные классифицированные результаты.
+             */
+            if (dnf || dns || dsq) {
+                continue;
+            }
+
+            int driverNumber =
+                    result.path("driver_number").asInt();
+
+            int finalPosition =
+                    result.path("position").asInt();
+
+            driverRepo.findByDriverNumber(driverNumber)
+                    .ifPresent(driver -> {
+
+                        if (histRepo
+                                .existsByDriver_IdAndGpNameAndSeason(
+                                        driver.getId(),
+                                        gpName,
+                                        season
+                                )) {
+                            return;
+                        }
+
+                        histRepo.save(
+                                HistoricalResult.builder()
+                                        .driver(driver)
+                                        .gpName(gpName)
+                                        .season(season)
+                                        .finalPosition(
+                                                finalPosition
+                                        )
+                                        .teamName(
+                                                driver.getTeam()
+                                        )
+                                        .sessionKey(
+                                                sessionKey
+                                        )
+                                        .build()
+                        );
+                    });
+        }
+
+        log.info(
+                "Historical results saved: {} {}",
+                gpName,
+                season
+        );
+    }
+
+    // =========================================================
+    // RACE RESULTS
+    // =========================================================
+
+    @Transactional
+    public void fetchAndSaveRaceResults(
+            Long gpId
+    ) {
+
+        GrandPrix gp =
+                gpRepo.findById(gpId)
+                        .orElseThrow();
+
+        if ("RACE_DONE".equals(gp.getStage())) {
+            return;
+        }
 
         try {
-            int year = gp.getRaceDate().getYear();
-            String country = gp.getCountry();
 
-            String sessionUrl = BASE_URL + "/sessions?year=" + year + "&country_name=" + country + "&session_name=Race";
-            JsonNode sessions = restTemplate.getForObject(sessionUrl, JsonNode.class);
-            if (sessions == null || sessions.isEmpty()) return;
+            int year =
+                    gp.getRaceDate().getYear();
 
-            int sessionKey = sessions.get(0).get("session_key").asInt();
-            String posJson = restTemplate.getForObject(BASE_URL + "/position?session_key=" + sessionKey, String.class);
-            JsonNode positions = objectMapper.readTree(posJson);
+            JsonNode sessions =
+                    getSessions(
+                            year,
+                            gp.getCountry(),
+                            "Race"
+                    );
 
-            Map<Integer, Integer> finalPositions = getFinalPositions(positions);
+            if (sessions == null
+                    || sessions.isEmpty()) {
+                return;
+            }
 
-            for (Map.Entry<Integer, Integer> entry : finalPositions.entrySet()) {
-                int drvNum = entry.getKey();
-                int finalPos = entry.getValue();
+            int sessionKey =
+                    sessions.get(0)
+                            .path("session_key")
+                            .asInt();
 
-                driverRepo.findByDriverNumber(drvNum).ifPresent(driver -> {
-                    // Ищем наш прогноз для этого пилота
-                    Prediction pred = predictionRepo.findByGrandPrix_IdAndDriver_Id(gpId, driver.getId());
-                    int errorMargin = 0;
-                    if (pred != null && pred.getPredictedPosition() != null) {
-                        errorMargin = Math.abs(pred.getPredictedPosition() - finalPos);
-                    }
+            String url =
+                    BASE_URL
+                            + "/session_result?session_key="
+                            + sessionKey;
 
-                    actualResultRepo.save(ActualResult.builder()
-                            .grandPrix(gp)
-                            .driver(driver)
-                            .finalPosition(finalPos)
-                            .errorMargin(errorMargin)
-                            .build());
-                });
+            JsonNode results =
+                    restTemplate.getForObject(
+                            url,
+                            JsonNode.class
+                    );
+
+            if (results == null) {
+                return;
+            }
+
+            for (JsonNode result : results) {
+
+                int driverNumber =
+                        result.path("driver_number").asInt();
+
+                int finalPosition =
+                        result.path("position").asInt();
+
+                driverRepo.findByDriverNumber(driverNumber)
+                        .ifPresent(driver ->
+                                saveActualResult(
+                                        gp,
+                                        driver,
+                                        finalPosition
+                                )
+                        );
             }
 
             gp.setStage("RACE_DONE");
             gpRepo.save(gp);
-            log.info("Гонка GP {} завершена. Результаты сохранены, ошибка прогноза вычислена.", gpId);
+
+            log.info(
+                    "Race results saved for GP {}",
+                    gpId
+            );
 
         } catch (Exception e) {
-            log.error("Ошибка при получении результатов гонки: {}", e.getMessage());
+
+            log.error(
+                    "Failed to fetch race results for GP {}",
+                    gpId,
+                    e
+            );
         }
     }
 
-    // --- ВСПОМОГАТЕЛЬНАЯ ЛОГИКА ---
+    private void saveActualResult(
+            GrandPrix gp,
+            Driver driver,
+            int finalPosition
+    ) {
 
-    /**
-     * Парсит массив позиций из API и возвращает Map<Номер пилота, Финальная позиция>
-     */
-    private Map<Integer, Integer> getFinalPositions(JsonNode positions) {
-        Map<Integer, Integer> finalPositions = new HashMap<>();
-        Map<Integer, String> latestDates = new HashMap<>();
+        Prediction prediction =
+                predictionRepo
+                        .findByGrandPrix_IdAndDriver_Id(
+                                gp.getId(),
+                                driver.getId()
+                        );
 
-        for (JsonNode posNode : positions) {
-            int drvNum = posNode.get("driver_number").asInt();
-            String date = posNode.get("date").asText();
-            int pos = posNode.get("position").asInt();
+        int errorMargin = 0;
 
-            if (!latestDates.containsKey(drvNum) || date.compareTo(latestDates.get(drvNum)) > 0) {
-                latestDates.put(drvNum, date);
-                finalPositions.put(drvNum, pos);
-            }
-        }
-        return finalPositions;
-    }
+        String errorType = "NO_PREDICTION";
 
-    /**
-     * Ленивая загрузка: пытается скачать реальные данные, но если они слишком большие (таймаут 3 сек),
-     * переключается на генерацию реалистичной заглушки.
-     */
-    @Transactional
-    public void fetchHistoryForGrandPrix(GrandPrix gp) {
-        if (histRepo.existsByGpName(gp.getName())) {
-            log.info("История для {} уже загружена.", gp.getName());
-            return;
-        }
+        String explanation =
+                "Прогноз для этого пилота отсутствовал.";
 
-        log.info("Попытка скачать историю из OpenF1 для {}...", gp.getName());
-        int currentYear = LocalDateTime.now().getYear();
-        int downloadedCount = 0;
+        if (prediction != null
+                && prediction.getPredictedPosition() != null) {
 
-        for (int year = currentYear - 1; year >= currentYear - 3; year--) {
-            try {
-                // 1. Скачиваем список гонок (это быстро, весит пару КБ)
-                String sessionsJson = restTemplate.getForObject(BASE_URL + "/sessions?session_name=Race&year=" + year, String.class);
-                JsonNode sessions = objectMapper.readTree(sessionsJson);
+            int predicted =
+                    prediction.getPredictedPosition();
 
-                if (sessions == null || sessions.size() == 0) continue;
+            errorMargin =
+                    Math.abs(
+                            predicted - finalPosition
+                    );
 
-                for (JsonNode session : sessions) {
-                    String countryName = session.path("country_name").asText();
+            if (errorMargin == 0) {
 
-                    if (countryName.equalsIgnoreCase(gp.getCountry())) {
-                        int sessionKey = session.path("session_key").asInt();
-                        log.info("Найдена гонка: {} ({}). Запрос позиций...", countryName, year);
+                errorType = "EXACT";
 
-                        // 2. Пытаемся скачать позиции (здесь может случиться таймаут из-за размера файла)
-                        String posJson = restTemplate.getForObject(BASE_URL + "/position?session_key=" + sessionKey, String.class);
-                        JsonNode positions = objectMapper.readTree(posJson);
+                explanation =
+                        "Прогноз полностью совпал " +
+                                "с фактическим результатом.";
 
-                        Map<Integer, Integer> finalPositions = getFinalPositions(positions);
-                        downloadedCount += finalPositions.size();
+            } else if (finalPosition > predicted) {
 
-                        for (Map.Entry<Integer, Integer> entry : finalPositions.entrySet()) {
-                            int finalYear = year;
-                            driverRepo.findByDriverNumber(entry.getKey()).ifPresent(driver -> {
-                                histRepo.save(HistoricalResult.builder()
-                                        .driver(driver)
-                                        .gpName(gp.getName())
-                                        .season(finalYear)
-                                        .finalPosition(entry.getValue())
-                                        .teamName(driver.getTeam())
-                                        .build());
-                            });
-                        }
-                        break;
-                    }
-                }
-            } catch (Exception e) {
-                // Если файл слишком большой (Read timed out) или обрыв связи (Unexpected end-of-input)
-                log.warn("Не удалось скачать/распарсить историю за {} год: {}. Файл слишком большой.", year, e.getClass().getSimpleName());
+                errorType = "OVERESTIMATED";
+
+                explanation =
+                        "Система завысила результат пилота " +
+                                "на " + errorMargin +
+                                " позиций.";
+
+            } else {
+
+                errorType = "UNDERESTIMATED";
+
+                explanation =
+                        "Система занизила результат пилота " +
+                                "на " + errorMargin +
+                                " позиций.";
             }
         }
 
-        // 3. Если реальные данные не скачались, используем заглушку
-        if (downloadedCount == 0) {
-            log.warn("Данные из API недоступны. Генерируем реалистичную заглушку для {}.", gp.getName());
-            generateMockHistoryForGp(gp);
-        } else {
-            log.info("Успешно сохранено {} реальных результатов для {}.", downloadedCount, gp.getName());
+        actualResultRepo.save(
+                ActualResult.builder()
+                        .grandPrix(gp)
+                        .driver(driver)
+                        .finalPosition(finalPosition)
+                        .errorMargin(errorMargin)
+                        .errorType(errorType)
+                        .errorExplanation(explanation)
+                        .build()
+        );
+    }
+
+    // =========================================================
+    // HELPERS
+    // =========================================================
+
+    private double parseGap(JsonNode gapNode) {
+
+        if (gapNode == null
+                || gapNode.isNull()) {
+            return 0.0;
+        }
+
+        if (gapNode.isNumber()) {
+            return gapNode.asDouble();
+        }
+
+        String value =
+                gapNode.asText();
+
+        if (value.startsWith("+")) {
+            value = value.substring(1);
+        }
+
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            return 0.0;
         }
     }
 
-    private void generateMockHistoryForGp(GrandPrix gp) {
-        List<Driver> drivers = driverRepo.findAll();
-        int currentYear = LocalDateTime.now().getYear();
+    private int getRaceSessionKey(
+            GrandPrix gp
+    ) {
 
-        for (Driver driver : drivers) {
-            int pos = getMockPosition2026(driver);
-            histRepo.save(HistoricalResult.builder()
-                    .driver(driver)
-                    .gpName(gp.getName())
-                    .season(currentYear - 1)
-                    .finalPosition(pos)
-                    .teamName(driver.getTeam())
-                    .build());
+        JsonNode sessions =
+                getSessions(
+                        gp.getRaceDate().getYear(),
+                        gp.getCountry(),
+                        "Race"
+                );
+
+        if (sessions == null
+                || sessions.isEmpty()) {
+            throw new IllegalStateException(
+                    "Race session not found"
+            );
         }
-    }
 
-    private int getMockPosition2026(Driver driver) {
-        String team = driver.getTeam() == null ? "" : driver.getTeam();
-
-        if (team.contains("Mercedes")) {
-            return (int)(Math.random() * 2) + 1; // 1-2 место
-        } else if (team.contains("Ferrari")) {
-            return (int)(Math.random() * 2) + 3; // 3-4 место
-        } else if (team.contains("Red Bull") || team.contains("McLaren")) {
-            return (int)(Math.random() * 4) + 5; // 5-8 место
-        } else if (team.contains("Aston Martin")) {
-            return (int)(Math.random() * 2) + 19; // 19-20 место
-        } else {
-            return (int)(Math.random() * 10) + 9; // 9-18 место
-        }
+        return sessions.get(0)
+                .path("session_key")
+                .asInt();
     }
 }
