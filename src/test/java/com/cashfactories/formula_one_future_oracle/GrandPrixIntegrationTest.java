@@ -36,21 +36,22 @@ class GrandPrixIntegrationTest {
     @Autowired private DriverRepository driverRepository;
     @Autowired private GrandPrixRepository grandPrixRepository;
     @Autowired private PredictionRepository predictionRepository;
-
-    @Autowired private HistoricalResultRepository historicalResultRepository;
     @Autowired private ActualResultRepository actualResultRepository;
+    @Autowired private HistoricalResultRepository historicalResultRepository;
 
     @MockitoBean
     private OpenF1Service openF1Service;
 
     @BeforeEach
     void setUp() {
+        // Очищаем все таблицы в правильном порядке (сначала зависимые)
         actualResultRepository.deleteAll();
         predictionRepository.deleteAll();
         historicalResultRepository.deleteAll();
         grandPrixRepository.deleteAll();
         driverRepository.deleteAll();
 
+        // Наполняем базу тестовыми данными
         Driver driver = driverRepository.save(Driver.builder().name("Lando Norris").team("McLaren").driverNumber(4).build());
 
         GrandPrix gp = GrandPrix.builder()

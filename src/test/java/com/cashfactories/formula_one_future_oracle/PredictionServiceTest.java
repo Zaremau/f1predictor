@@ -49,32 +49,28 @@ class PredictionServiceTest {
         when(gpRepo.findById(1L)).thenReturn(Optional.of(testGp));
         when(driverRepo.findAll()).thenReturn(List.of(testDriver));
 
-        // Мокаем историю: Ферстаппен всегда финишировал 1-м (Score должен быть 100)
-        HistoricalResult histResult = HistoricalResult.builder().driver(testDriver).finalPosition(1).build();
-        when(histRepo.findByDriver_Id(anyLong())).thenReturn(List.of(histResult));
-        when(histRepo.findByDriver_IdAndGpName(anyLong(), anyString())).thenReturn(List.of(histResult));
+        // НОВОЕ: Мокаем JPQL запросы к базе. Возвращаем среднее место = 1.0 (Score = 100)
+        when(histRepo.findAveragePositionByDriverAndSeason(anyLong(), anyInt())).thenReturn(1.0);
+        when(histRepo.findAverageTrackPosition(anyLong(), anyString(), anyInt())).thenReturn(1.0);
 
-        // Мокаем новости: Нет новостей (Score должен быть нейтральным - 50)
+        // Новости: Нет новостей (Score = 50)
         when(newsRepo.findByGrandPrix_Id(anyLong())).thenReturn(Collections.emptyList());
 
-        // Мокаем сохранение в БД, чтобы просто вернуть тот же прогноз
         when(predictionRepo.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
 
-        // Act (Действие)
+        // Act
         List<Prediction> predictions = predictionService.generatePredictions(1L);
-
-        // Assert (Проверка)
-        assertFalse(predictions.isEmpty());
         Prediction maxPred = predictions.get(0);
 
-        // Проверяем, что он на 1-м месте
+        // Assert
         assertEquals(1, maxPred.getPredictedPosition());
 
-        // Проверяем математику: (100 * 0.5) + (100 * 0.2) + (50 * 0.3) = 50 + 20 + 15 = 85
+        // Проверяем математику: (100 * 0.5) + (100 * 0.2) + (50 * 0.3) = 85
         assertEquals(85.0, maxPred.getScore());
 
-        // Проверяем уверенность для стадии UPCOMING
-        assertEquals(0.4, maxPred.getConfidence());
+        // Проверяем новую математику уверенности:
+        // base(0.4) + scoreComponent(|85-50|/50*0.15 = 0.105) + dataBonus(0.05+0.03 = 0.08) - disagreement(0) = 0.585
+        assertEquals(0.585, maxPred.getConfidence());
     }
 
     @Test
@@ -83,9 +79,8 @@ class PredictionServiceTest {
         when(gpRepo.findById(1L)).thenReturn(Optional.of(testGp));
         when(driverRepo.findAll()).thenReturn(List.of(testDriver));
 
-        HistoricalResult histResult = HistoricalResult.builder().driver(testDriver).finalPosition(1).build();
-        when(histRepo.findByDriver_Id(anyLong())).thenReturn(List.of(histResult));
-        when(histRepo.findByDriver_IdAndGpName(anyLong(), anyString())).thenReturn(List.of(histResult));
+        when(histRepo.findAveragePositionByDriverAndSeason(anyLong(), anyInt())).thenReturn(1.0);
+        when(histRepo.findAverageTrackPosition(anyLong(), anyString(), anyInt())).thenReturn(1.0);
 
         // Мокаем плохую новость с риском
         News badNews = News.builder()
@@ -104,34 +99,31 @@ class PredictionServiceTest {
 
         // Assert
         // News Score = 50 + (-0.8 * 50) = 10.
-        // С новыми весами: (100*0.5) + (100*0.2) + (10*0.3) = 50 + 20 + 3 = 73
-        // Штраф за риск: 73 - 15 = 58
+        // (100*0.5) + (100*0.2) + (10*0.3) = 50 + 20 + 3 = 73. Штраф: 73 - 15 = 58.
         assertEquals(58.0, maxPred.getScore());
-        assertEquals("HIGH", maxPred.getRiskLevel()); // Риск должен быть высоким из-за штрафа
+        assertEquals("HIGH", maxPred.getRiskLevel());
+
+        // Уверенность: base(0.4) + scoreComponent(|58-50|/50*0.15 = 0.024) + dataBonus(0.08) - disagreement(0) - hasPenalty(0.05) = 0.454
+        assertEquals(0.454, maxPred.getConfidence());
     }
 
     @Test
     void generatePredictions_WhenQualiDone_ShouldCalculateBasedOnQualifyingAndPractice() {
         // Arrange
-        // Меняем стадию на QUALI_DONE
         testGp.setStage("QUALI_DONE");
         when(gpRepo.findById(1L)).thenReturn(Optional.of(testGp));
         when(driverRepo.findAll()).thenReturn(List.of(testDriver));
 
-        // История: 1 место (Score = 100)
-        HistoricalResult histResult = HistoricalResult.builder().driver(testDriver).finalPosition(1).build();
-        when(histRepo.findByDriver_Id(anyLong())).thenReturn(List.of(histResult));
-        when(histRepo.findByDriver_IdAndGpName(anyLong(), anyString())).thenReturn(List.of(histResult));
-
-        // Новости: Нет (Score = 50)
+        when(histRepo.findAveragePositionByDriverAndSeason(anyLong(), anyInt())).thenReturn(1.0);
+        when(histRepo.findAverageTrackPosition(anyLong(), anyString(), anyInt())).thenReturn(1.0);
         when(newsRepo.findByGrandPrix_Id(anyLong())).thenReturn(Collections.emptyList());
 
-        // Практика: Отрыв от лидера 0 секунд (Score = 100)
-        PracticeResult pr = PracticeResult.builder().gapToP1Ms(0).build();
+        // НОВОЕ: Практика с position=1 и gap=0 (Score = 100)
+        PracticeResult pr = PracticeResult.builder().position(1).gapToP1Ms(0).build();
         when(practiceRepo.findTopByGrandPrix_IdAndDriver_IdOrderByLapTimeMsAsc(anyLong(), anyLong())).thenReturn(pr);
 
-        // Квалификация: Поул-позиция (1 место) (Score = 100)
-        QualifyingResult qr = QualifyingResult.builder().position(1).build();
+        // НОВОЕ: Квалификация с position=1 и startingGrid=1 (Score = 100)
+        QualifyingResult qr = QualifyingResult.builder().position(1).startingGrid(1).build();
         when(qualiRepo.findByGrandPrix_IdAndDriver_Id(anyLong(), anyLong())).thenReturn(qr);
 
         when(predictionRepo.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
@@ -141,11 +133,11 @@ class PredictionServiceTest {
         Prediction maxPred = predictions.get(0);
 
         // Assert
-        // Формула для QUALI_DONE: (история*0.2) + (история_трека*0.1) + (новости*0.1) + (практика*0.2) + (квалификация*0.4)
-        // (100*0.2) + (100*0.1) + (50*0.1) + (100*0.2) + (100*0.4) = 20 + 10 + 5 + 20 + 40 = 95
+        // (100*0.2) + (100*0.1) + (50*0.1) + (100*0.2) + (100*0.4) = 95
         assertEquals(95.0, maxPred.getScore());
 
-        // Уверенность для QUALI_DONE должна быть 0.9
-        assertEquals(0.9, maxPred.getConfidence());
+        // Уверенность: base(0.7) + scoreComponent(|95-50|/50*0.15 = 0.135) + dataBonus(0.05+0.03+0.05+0.07 = 0.20) - disagreement(0) = 1.035
+        // Ограничено сверху 0.99
+        assertEquals(0.99, maxPred.getConfidence());
     }
 }
